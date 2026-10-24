@@ -237,6 +237,21 @@ config APPLE_T6030_DISPLAY_GATE
 	  not come up, also keeps the GPU off for that boot. It is not a
 	  display-only switch.
 
+	  On a J516C, apple_t6031_display.ext=1 as well also describes the
+	  HDMI port, which the boot loader does not: from the boot loader's
+	  ADT export it adds the first external display processor with the
+	  firmware iBoot preloaded, its DARTs, mailbox and PMP request, and
+	  the HDMI PHY with its calibration (the ADT's common tunables, as the
+	  boot loader passes T6030's), and gives it a DRM device of its own
+	  (apple-drm-ext), so that it never holds up the internal display.
+	  The PMP starts as it does without the option: the request is set
+	  only once the PMP has started, and the processor's power states come
+	  up only once the PMP has acknowledged it. If anything does not check
+	  out, nothing of it is added.
+	  apple_t6031_display.ext_clock sets the display clock rate its
+	  firmware is told (default 935 MHz). Without the option nothing
+	  changes.
+
 	  J514M/T6034 uses an independent apple,t6034-handoff profile and the
 	  same checked PMP firmware layout. It starts on normal boots of that
 	  exact board and SoC pair; apple_t6034_display.enable=0 retains the

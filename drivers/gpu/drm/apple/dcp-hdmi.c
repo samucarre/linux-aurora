@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * HDMI port of the T6030 (M3 Pro) MacBook Pros.
+ * HDMI port of the T6030 (M3 Pro) MacBook Pros, and of the J516C (T6031,
+ * M3 Max) once the display gate describes its first external processor.
  *
  * The port hangs off the first external display coprocessor: it drives
  * ATC3 as a four-lane DisplayPort PHY into an on-board DP-to-HDMI
@@ -19,7 +20,8 @@
  *    the rate those modes use, because not every request of the converter
  *    shows up as a pulse on the GPIO.
  *
- * Only the T6030 external coprocessor with a fixed HDMI route uses this.
+ * Only the T6030 and T6031 external coprocessors with a fixed HDMI route use
+ * this.
  */
 
 #include <linux/atomic.h>
@@ -34,6 +36,7 @@
 #include <drm/drm_mode.h>
 
 #include "afk.h"
+#include "dcp.h"
 #include "dcp-hdmi.h"
 #include "dcp-internal.h"
 #include "dptxep.h"
@@ -212,7 +215,7 @@ int dcp_hdmi_init(struct apple_dcp *dcp)
 
 	if (!dcp->hdmi_hpd ||
 	    dcp->fixed_connector_type != DRM_MODE_CONNECTOR_HDMIA ||
-	    !of_device_is_compatible(dcp->dev->of_node, "apple,t6030-dcpext"))
+	    !dcp_is_v14_ext_node(dcp->dev->of_node))
 		return 0;
 
 	hdmi = devm_kzalloc(dcp->dev, sizeof(*hdmi), GFP_KERNEL);

@@ -2042,6 +2042,21 @@ static void dcpext_ready_work(struct work_struct *work)
 }
 
 /*
+ * The image an external processor must run: T6030's, or on the J516C
+ * (T6031) the panel's own 14.7 image, which the display gate only gives
+ * dcpext0 when the boot loader and the ADT name it for both. The external
+ * role's layouts are taken to be those of the 14.7 interface, as the panel's
+ * are on this image; its first boots show them.
+ */
+static const char *dcpext_firmware_uuid(const struct device_node *np)
+{
+	if (of_device_is_compatible(np, "apple,t6031-dcpext") &&
+	    of_machine_is_compatible("apple,j516c"))
+		return DCP_V14_J516C_FIRMWARE_UUID;
+	return DCP_V14_FIRMWARE_UUID;
+}
+
+/*
  * The native path, at probe: the same checks as a manual start, without a
  * start. The coprocessor registers are mapped here, once, for the start
  * work and component bind alike. A failed check leaves the pipe in the DRM
@@ -2071,9 +2086,9 @@ int iomfb_v14_7_external_prepare(struct apple_dcp *dcp)
 		dcp->coproc_reg = NULL;
 		goto refuse;
 	}
-	/* The callbacks here are those of one firmware image. */
+	/* The callbacks here are those of one firmware image per board. */
 	if (of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
-	    strcmp(uuid, DCP_V14_FIRMWARE_UUID)) {
+	    strcmp(uuid, dcpext_firmware_uuid(dev->of_node))) {
 		dev_err(dev, "external display processor firmware %s is not supported\n",
 			uuid ?: "(unknown)");
 		ret = -ENODEV;
@@ -2171,6 +2186,16 @@ static int dcpext_check_power(struct apple_dcp *dcp)
 	int ret;
 
 	ps = of_parse_phandle(dev->of_node, "power-domains", 0);
+	/*
+	 * T6031 nests the processor's front end under its CPU: the processor
+	 * is in dispext<N>_fe, and the floor is on that domain's parent.
+	 */
+	if (ps && of_device_is_compatible(dev->of_node, "apple,t6031-dcpext")) {
+		struct device_node *cpu = of_parse_phandle(ps, "power-domains", 0);
+
+		of_node_put(ps);
+		ps = cpu;
+	}
 	if (!ps)
 		return -ENODEV;
 	/* The CPU domain of this pipe: dispext<N>_cpu. */

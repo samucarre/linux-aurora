@@ -41,7 +41,10 @@ config APPLE_PMP_REPORT
 	  whose boot loader hands the
 	  internal display over (see APPLE_T6030_DISPLAY_GATE), iBoot leaves
 	  the PMP halted, and this driver starts it when the display driver
-	  first asks for it. Once its nodes are enabled the PMP may run until
+	  first asks for it. A request the start does not need (the J516C
+	  HDMI port's) can instead be set once the started PMP is ready,
+	  ahead of the power states it guards. Once its nodes are enabled
+	  the PMP may run until
 	  the next reboot. That holds when the start then fails, too (the PMP
 	  driver does not bind, or the PMP does not report ready or does not
 	  acknowledge the startup requests): nothing stops the PMP, this

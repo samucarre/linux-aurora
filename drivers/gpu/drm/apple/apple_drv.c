@@ -52,6 +52,15 @@
 
 #define MAX_COPROCESSORS 8
 
+/*
+ * A console framebuffer on a display subsystem that drives only the DCPs it
+ * lists (the T6031 external displays). Off by default: registered before the
+ * panel's, it would take the console when the boot framebuffer goes.
+ */
+static bool ext_fbdev;
+module_param(ext_fbdev, bool, 0444);
+MODULE_PARM_DESC(ext_fbdev, "Console framebuffer on the external displays' own DRM device");
+
 struct apple_drm_private {
 	struct drm_device drm;
 };
@@ -909,15 +918,59 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
  * A supported firmware-described external provider participates in component
  * matching. A T6030 external display processor is a pipe of this DRM device
  * once the display gate gave it its display DART; on the manual diagnostic
- * path it runs a separate session and never joins this DRM device.
+ * path it runs a separate session and never joins this DRM device. The T6031
+ * one is a pipe of the external displays' own DRM device in the same way.
  */
 static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
-	       (!of_device_is_compatible(np, "apple,t6030-dcpext") ||
-		dcp_t6030_ext_native(np)) &&
+	       (!dcp_is_v14_ext_node(np) || dcp_t6030_ext_native(np)) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		dcp_h17p_external_supported(np));
+}
+
+static bool apple_dcp_listed_by(struct device_node *subsys, struct device_node *dcp)
+{
+	struct of_phandle_iterator it;
+	int err;
+
+	of_for_each_phandle(&it, err, subsys, "apple,dcps", NULL, 0) {
+		if (it.node == dcp) {
+			of_node_put(it.node);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * A display subsystem with apple,dcps drives only the DCPs it lists, as a
+ * DRM device of its own; one without drives every DCP that no other
+ * available display subsystem lists. The T6031 display gate gives the
+ * external display processor such a subsystem, so that one that never
+ * probes cannot hold the panel's DRM device back.
+ */
+static bool apple_dcp_selected(struct device *dev, struct device_node *dcp)
+{
+	struct device_node *np;
+
+	if (of_property_present(dev->of_node, "apple,dcps"))
+		return apple_dcp_listed_by(dev->of_node, dcp);
+
+	for_each_node_with_property(np, "apple,dcps") {
+		if (np != dev->of_node && of_device_is_available(np) &&
+		    apple_dcp_listed_by(np, dcp)) {
+			of_node_put(np);
+			return false;
+		}
+	}
+	return true;
+}
+
+/* A subsystem for listed DCPs only: no boot framebuffer to take over. */
+static bool apple_drm_has_boot_fb(struct device *dev)
+{
+	return !of_property_present(dev->of_node, "apple,dcps");
 }
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)
@@ -955,7 +1008,7 @@ static int apple_drm_init_dcp(struct device *dev)
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
 		bool dcp_ext;
-		if (!apple_dcp_usable(np))
+		if (!apple_dcp_usable(np) || !apple_dcp_selected(dev, np))
 			continue;
 		dcp_ext = of_device_is_compatible(np, "apple,dcpext") ||
 		          of_device_is_compatible(np, "apple,t8140-dcpext") ||
@@ -1046,7 +1099,8 @@ static int apple_drm_init_dcp(struct device *dev)
 	 * screen black with nothing to replace it: fail instead, so that the
 	 * boot framebuffer stays.
 	 */
-	if (!apple_boot_display_up(connector_type, ready, num_dcp)) {
+	if (apple_drm_has_boot_fb(dev) &&
+	    !apple_boot_display_up(connector_type, ready, num_dcp)) {
 		dev_err(dev, "no display processor that can show the boot framebuffer came up; keeping the boot framebuffer\n");
 		return -ENODEV;
 	}
@@ -1060,7 +1114,8 @@ static int apple_drm_init_dcp(struct device *dev)
 static int apple_drm_init(struct device *dev)
 {
 	struct apple_drm_private *apple;
-	struct resource fb_r;
+	bool boot_fb = apple_drm_has_boot_fb(dev);
+	struct resource fb_r = {};
 	resource_size_t fb_size;
 	int ret;
 
@@ -1068,9 +1123,11 @@ static int apple_drm_init(struct device *dev)
 	if (ret)
 		return ret;
 
-	ret = apple_get_fb_resource(dev, "framebuffer", &fb_r);
-	if (ret)
-		return ret;
+	if (boot_fb) {
+		ret = apple_get_fb_resource(dev, "framebuffer", &fb_r);
+		if (ret)
+			return ret;
+	}
 
 	apple = devm_drm_dev_alloc(dev, &apple_drm_driver,
 				   struct apple_drm_private, drm);
@@ -1113,12 +1170,14 @@ static int apple_drm_init(struct device *dev)
 
 	drm_mode_config_reset(&apple->drm);
 
-	fb_size = fb_r.end - fb_r.start + 1;
-	ret = aperture_remove_conflicting_devices(fb_r.start, fb_size,
-						  apple_drm_driver.name);
-	if (ret) {
-		dev_err(dev, "Failed remove fb: %d\n", ret);
-		goto err_unbind;
+	if (boot_fb) {
+		fb_size = fb_r.end - fb_r.start + 1;
+		ret = aperture_remove_conflicting_devices(fb_r.start, fb_size,
+							  apple_drm_driver.name);
+		if (ret) {
+			dev_err(dev, "Failed remove fb: %d\n", ret);
+			goto err_unbind;
+		}
 	}
 
 	ret = drm_dev_register(&apple->drm, 0);
@@ -1128,7 +1187,8 @@ static int apple_drm_init(struct device *dev)
 	/* the fabric keeps order only once registered: catch up on probe */
 	dcp_typec_reorder();
 
-	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
+	if (boot_fb || ext_fbdev)
+		drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
 	/* A subsequent successful platform probe retries deferred GPU probes. */
 	ret = apple_g15_display_publish(dev);
@@ -1187,7 +1247,7 @@ static int add_dcp_components(struct device *dev,
 	int num = 0;
 
 	for_each_matching_node(np, apple_dcp_id_tbl) {
-		if (apple_dcp_usable(np)) {
+		if (apple_dcp_usable(np) && apple_dcp_selected(dev, np)) {
 			drm_of_component_match_add(dev, matchptr,
 						   component_compare_of, np);
 			num++;
@@ -1231,6 +1291,14 @@ static int apple_platform_probe(struct platform_device *pdev)
 	struct device *mdev = &pdev->dev;
 	struct component_match *match = NULL;
 	int num_dcp;
+
+	/*
+	 * A subsystem for listed DCPs scans out through their display DARTs
+	 * alone: never without them, as after an IOMMU given up at the
+	 * deferred probe timeout.
+	 */
+	if (!apple_drm_has_boot_fb(mdev) && !device_iommu_mapped(mdev))
+		return dev_err_probe(mdev, -ENODEV, "no IOMMU for the listed DCPs\n");
 
 	/* add DCP components, handle less than 1 as probe error */
 	num_dcp = add_dcp_components(mdev, &match);
@@ -1320,6 +1388,30 @@ static struct platform_driver apple_platform_driver = {
 	.remove		= apple_platform_remove,
 };
 
+/*
+ * The T6031 external displays' display subsystem, which the display gate
+ * adds. Bound by a driver of its own, so that the panel's DRM device stays
+ * the only "apple-drm" one for userspace that picks a device by driver.
+ */
+static const struct of_device_id ext_of_match[] = {
+	{ .compatible = "apple,t6031-dispext-subsystem" },
+	{}
+};
+MODULE_DEVICE_TABLE(of, ext_of_match);
+
+static struct platform_driver apple_ext_platform_driver = {
+	.driver	= {
+		.name = "apple-drm-ext",
+		.of_match_table	= ext_of_match,
+#ifdef CONFIG_PM_SLEEP
+		.pm = &apple_platform_pm_ops,
+#endif
+	},
+	.probe		= apple_platform_probe,
+	.remove		= apple_platform_remove,
+};
+
+static bool apple_ext_registered;
 
 static int __init appledrm_register(void)
 {
@@ -1341,8 +1433,11 @@ static int __init appledrm_register(void)
 	if (ret)
 		goto unregister_audio;
 	ret = platform_driver_register(&apple_platform_driver);
-	if (!ret)
+	if (!ret) {
+		/* Optional: the panel's DRM device goes on without it. */
+		apple_ext_registered = !platform_driver_register(&apple_ext_platform_driver);
 		return 0;
+	}
 	dcp_unregister();
 unregister_audio:
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
@@ -1357,6 +1452,8 @@ static void __exit appledrm_unregister(void)
 	dcp_audio_unregister();
 #endif
 	dcp_unregister();
+	if (apple_ext_registered)
+		platform_driver_unregister(&apple_ext_platform_driver);
 	platform_driver_unregister(&apple_platform_driver);
 }
 

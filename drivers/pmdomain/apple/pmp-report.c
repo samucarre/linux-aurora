@@ -339,6 +339,8 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
  *     the PMP driver then patches the boot arguments and runs the firmware;
  *  5. it waits for the PMP driver to bind, the PTD to report ready and the
  *     startup requests to be acknowledged.
+ * Entries marked apple,request-after-start set their requests only after
+ * step 5 (see "Requests set after the start").
  * From step 4 on the PMP runs, and only a reboot stops it. That stays so
  * when step 5 fails: nothing stops the PMP, and the display stays on the boot
  * framebuffer. There is no safe stop to take instead. The PMP driver has no
@@ -405,6 +407,11 @@ struct apple_pmp_start {
 	u64 startup_ack;
 	/* Seeded bits that are soc-device record indices. */
 	u64 record_seed;
+	/*
+	 * Requests set only once the start has completed, by entries marked
+	 * apple,request-after-start, each once the PMP acknowledged it.
+	 */
+	u64 after;
 	struct of_changeset pmp_cs;
 	const struct apple_pmp_start_ops *ops;
 	const struct apple_pmp_start_timing *timing;
@@ -659,7 +666,9 @@ static int apple_pmp_start_describe(struct apple_pmp_report *rep,
 	int ret;
 
 	for_each_available_child_of_node(rep->dev->of_node, child) {
-		if (!of_property_read_bool(child, "apple,always-on"))
+		/* A request set after the start is never seeded, nor waited for. */
+		if (!of_property_read_bool(child, "apple,always-on") ||
+		    of_property_read_bool(child, "apple,request-after-start"))
 			continue;
 		ret = apple_pmp_report_bit(st, child, &id, &record);
 		if (ret == -EINVAL)
@@ -1019,7 +1028,7 @@ static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id,
 		} else if (!ret) {
 			if (st->result) {
 				ret = st->result;
-			} else if (!(st->ack & BIT_ULL(id))) {
+			} else if (!((st->ack | st->after) & BIT_ULL(id))) {
 				ret = -EINVAL;
 			} else {
 				status = readq(st->rep->base + st->rep->offsets->status);
@@ -1039,13 +1048,15 @@ static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id,
  * @timeout: in jiffies
  *
  * For a report whose halted PMP this driver starts (see above): the first
- * call starts it.
+ * call starts it. @entry is one of its acknowledged startup requests, or a
+ * request set after the start (apple,request-after-start), which counts once
+ * its entry has set it and the PMP has acknowledged it.
  *
  * Context: Process context; sleeps.
  * Return: 0 once the PMP runs and has acknowledged @entry, -EPROBE_DEFER
  * while the report driver has not probed yet, -ENODEV if no PMP was handed
  * over to this report, -EINVAL if @entry is not one of its acknowledged
- * requests, or the reason the PMP was not started or is not ready.
+ * requests (yet), or the reason the PMP was not started or is not ready.
  */
 int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout)
 {
@@ -1371,6 +1382,71 @@ int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable)
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
 
+/*
+ * Requests set after the start (apple,request-after-start)
+ *
+ * An entry so marked is not seeded: the PMP starts with the startup requests
+ * alone, as it would without the entry, and nothing in the start waits for
+ * it. The entry sets its request only once the start has completed, and
+ * provides its power domain only once the running PMP has acknowledged it.
+ * The PMGR domains that name the entry as their parent, and every device in
+ * them, are therefore probed and powered only after the PMP has taken the
+ * block they make up. The request is never released: the entry's domain is
+ * always on and has no power callbacks.
+ *
+ * apple_pmp_start_request_after() sets request @id and waits, sleeping, for
+ * its acknowledgment, which it reads back with the request into @ack and
+ * @request. It returns 0 once @id is acknowledged; -EPROBE_DEFER until the
+ * start has completed; -ENODEV if the PMP did not start; -EINVAL if @id is a
+ * startup request; -EIO if the PMP is not ready, when nothing is requested,
+ * or did not keep the request; and -ETIMEDOUT if the PMP does not
+ * acknowledge @id within the startup acknowledgment timeout, when the
+ * request stays set. A request it has had acknowledged before is only
+ * checked again.
+ */
+static int apple_pmp_start_request_after(struct apple_pmp_start *st, u32 id,
+					 u64 *request, u64 *ack)
+{
+	struct apple_pmp_report *rep = st->rep;
+	u64 bit = BIT_ULL(id);
+	bool again;
+	int ret;
+
+	*request = 0;
+	*ack = 0;
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		if (st->stopping)
+			return -ENODEV;
+		if (!completion_done(&st->started))
+			return -EPROBE_DEFER;
+		/* The start logged why it failed. */
+		if (st->result)
+			return -ENODEV;
+		if (st->seed & bit)
+			return -EINVAL;
+		again = st->after & bit;
+	}
+
+	if (readq(rep->base + rep->offsets->status) == PMP_REPORT_READY) {
+		if (!again)
+			apple_pmp_report_set_state(rep, id, true, true);
+		/* As for the startup requests, only the acknowledgment is polled. */
+		ret = readq_poll_timeout(rep->base + rep->offsets->actual, *ack, *ack & bit,
+					 USEC_PER_MSEC, st->timing->ack * USEC_PER_MSEC);
+	} else {
+		ret = -EIO;
+	}
+	*request = readq(rep->base + rep->offsets->tgt_read);
+	*ack = readq(rep->base + rep->offsets->actual);
+	if (!ret && !(*request & *ack & bit))
+		ret = -EIO;
+	if (!ret && !again) {
+		scoped_guard(mutex, &apple_pmp_start_mutex)
+			st->after |= bit;
+	}
+	return ret;
+}
+
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
@@ -1497,6 +1573,64 @@ static void apple_pmp_report_entry_remove(struct platform_device *pdev)
 	apple_pmp_report_entry_free(ent);
 }
 
+/*
+ * An entry whose request is set after the start (see "Requests set after
+ * the start"): one the running PMP acknowledges, as its soc-device record
+ * says, with no parent domain, as it comes before the power it guards.
+ * Returns 0 once the request is acknowledged, -EPROBE_DEFER until the start
+ * has completed, or why the entry cannot be used.
+ */
+static int apple_pmp_report_entry_after_start(struct device *dev, struct apple_pmp_start *st,
+					      struct apple_pmp_report_entry *ent)
+{
+	struct device_node *node = dev->of_node;
+	u64 bit = BIT_ULL(ent->id), request, ack;
+	const u8 *table;
+	int len = 0, ret;
+	bool valid;
+
+	if (!st)
+		return dev_err_probe(dev, -EINVAL,
+				     "a request set after the start needs a PMP this report starts\n");
+	if (ent->no_ack || of_property_read_bool(node, "apple,always-on") ||
+	    of_property_present(node, "power-domains"))
+		return dev_err_probe(dev, -EINVAL,
+				     "a request set after the start is acknowledged, not seeded, and has no parent domain\n");
+	table = of_get_property(st->pmp, "apple,tunable-soc-device", &len);
+	if (of_property_read_bool(node, "apple,soc-device-record"))
+		valid = apple_pmp_records_valid(table, len > 0 ? len : 0, bit, bit);
+	else
+		valid = apple_pmp_devices_valid(table, len > 0 ? len : 0, bit, bit,
+						st->rep->offsets->devices_ordered);
+	if (!valid)
+		return dev_err_probe(dev, -EINVAL,
+				     "request bit %u has no soc-device record the PMP acknowledges\n",
+				     ent->id);
+
+	ret = apple_pmp_start_request_after(st, ent->id, &request, &ack);
+	switch (ret) {
+	case 0:
+		dev_info(dev, "%s acknowledged after the PMP start: request %#llx ack %#llx\n",
+			 ent->genpd.name, request, ack);
+		return 0;
+	case -EPROBE_DEFER:
+		return dev_err_probe(dev, ret, "waiting for the PMP start\n");
+	case -ETIMEDOUT:
+		dev_err(dev, "%s not acknowledged within %u ms of its request after the PMP start: request %#llx ack %#llx; the request stays set\n",
+			ent->genpd.name, st->timing->ack, request, ack);
+		return ret;
+	case -EIO:
+		dev_err(dev, "%s: the PMP is not ready, or did not keep the request: request %#llx ack %#llx\n",
+			ent->genpd.name, request, ack);
+		return ret;
+	case -EINVAL:
+		return dev_err_probe(dev, ret, "%s is a startup request\n", ent->genpd.name);
+	default:
+		return dev_err_probe(dev, ret, "%s not requested: the PMP did not start\n",
+				     ent->genpd.name);
+	}
+}
+
 static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1504,6 +1638,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	struct apple_pmp_report_entry *ent;
 	const struct apple_pmp_report *rep;
 	struct apple_pmp_start *start;
+	bool after;
 	int ret;
 	const char *name;
 	struct of_phandle_iterator it;
@@ -1550,15 +1685,23 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 		goto err_free;
 	}
 
-	if (of_property_read_bool(node, "apple,always-on")) {
-		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
-		apple_pmp_report_entry_set_state(&ent->genpd, true);
+	after = of_property_read_bool(node, "apple,request-after-start");
+	if (after) {
+		ret = apple_pmp_report_entry_after_start(dev, start, ent);
+		if (ret)
+			goto err_free;
+		/* On from here, and the parent of IRQ-safe PMGR domains. */
+		ent->genpd.flags |= GENPD_FLAG_ALWAYS_ON | GENPD_FLAG_IRQ_SAFE;
+	} else {
+		if (of_property_read_bool(node, "apple,always-on")) {
+			ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+			apple_pmp_report_entry_set_state(&ent->genpd, true);
+		}
+		ent->genpd.power_on = apple_pmp_report_entry_power_on;
+		ent->genpd.power_off = apple_pmp_report_entry_power_off;
 	}
 
-	ent->genpd.power_on = apple_pmp_report_entry_power_on;
-	ent->genpd.power_off = apple_pmp_report_entry_power_off;
-
-	ret = pm_genpd_init(&ent->genpd, NULL, true);
+	ret = pm_genpd_init(&ent->genpd, NULL, !after);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "pm_genpd_init failed\n");
 		goto err_free;

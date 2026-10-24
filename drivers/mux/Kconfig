@@ -50,7 +50,8 @@ config MUX_APPLE_DPXBAR
 
 	  This drivers adds support for the display crossbar used to route
 	  display controller streams to the three different modes
-	  (DP AltMode, USB4 Tunnel #0/#1) of the Type-C ports.
+	  (DP AltMode, USB4 Tunnel #0/#1) of the Type-C ports, and to the
+	  fixed DisplayPort PHY of the HDMI port.
 
 	  To compile this driver as a module, chose M here: the module will be
 	  called mux-apple-display-crossbar.
