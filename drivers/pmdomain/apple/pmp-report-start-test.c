@@ -64,6 +64,11 @@ static void pst_write(struct pst *t, u32 offset, u64 val)
 	WRITE_ONCE(t->regs[offset / sizeof(u64)], val);
 }
 
+static u64 pst_read(struct pst *t, u32 offset)
+{
+	return READ_ONCE(t->regs[offset / sizeof(u64)]);
+}
+
 static int pst_check(struct apple_pmp_start *st, uuid_t *image)
 {
 	uuid_gen(image);
@@ -384,7 +389,76 @@ static void pmp_start_t6030_external_first_test(struct kunit *test)
 	pst_drain(t);
 }
 
+/*
+ * A request set after the start (apple,request-after-start), bit 9: never
+ * before the start has completed, never a startup request, and waited for
+ * once the PMP has acknowledged it.
+ */
+static void pmp_start_after_request_test(struct kunit *test)
+{
+	struct pst *t = pst_new(test);
+	u64 request, ack;
+
+	KUNIT_EXPECT_EQ(test, apple_pmp_start_request_after(&t->st, 9, &request, &ack),
+			-EPROBE_DEFER);
+	KUNIT_EXPECT_EQ(test, pst_read(t, pst_offsets.tgt_write), 0ULL);
+	KUNIT_ASSERT_EQ(test, pst_wait(t, 0, 5000), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmp_start_request_after(&t->st, 5, &request, &ack),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 9, 1), -EINVAL);
+
+	/* The PTD as the running PMP shows it once it has taken bit 9. */
+	pst_write(t, pst_offsets.tgt_read, PST_SEED | BIT_ULL(9));
+	pst_write(t, pst_offsets.actual, PST_ACK | BIT_ULL(9));
+	KUNIT_EXPECT_EQ(test, apple_pmp_start_request_after(&t->st, 9, &request, &ack), 0);
+	KUNIT_EXPECT_EQ(test, pst_read(t, pst_offsets.tgt_write), PST_SEED | BIT_ULL(9));
+	KUNIT_EXPECT_EQ(test, request, PST_SEED | BIT_ULL(9));
+	KUNIT_EXPECT_EQ(test, ack, PST_ACK | BIT_ULL(9));
+	KUNIT_EXPECT_EQ(test, t->st.after, BIT_ULL(9));
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 9, 1), 0);
+
+	/* Asked again, it is only checked. */
+	pst_write(t, pst_offsets.tgt_write, 0);
+	KUNIT_EXPECT_EQ(test, apple_pmp_start_request_after(&t->st, 9, &request, &ack), 0);
+	KUNIT_EXPECT_EQ(test, pst_read(t, pst_offsets.tgt_write), 0ULL);
+	KUNIT_EXPECT_EQ(test, t->pmp.enables, 1U);
+	pst_drain(t);
+}
+
+/* Not acknowledged: a timeout, the request left set, and nothing to wait for. */
+static void pmp_start_after_no_ack_test(struct kunit *test)
+{
+	struct pst *t = pst_new(test);
+	u64 request, ack;
+
+	KUNIT_ASSERT_EQ(test, pst_wait(t, 0, 5000), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmp_start_request_after(&t->st, 9, &request, &ack),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, pst_read(t, pst_offsets.tgt_write), PST_SEED | BIT_ULL(9));
+	KUNIT_EXPECT_EQ(test, ack, PST_ACK);
+	KUNIT_EXPECT_EQ(test, t->st.after, 0ULL);
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 9, 1), -EINVAL);
+	pst_drain(t);
+}
+
+/* After a failed start nothing is requested. */
+static void pmp_start_after_failed_start_test(struct kunit *test)
+{
+	struct pst *t = pst_new(test);
+	u64 request, ack;
+
+	t->pmp.ready = false;
+	KUNIT_EXPECT_EQ(test, pst_wait(t, 0, 5000), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_pmp_start_request_after(&t->st, 9, &request, &ack),
+			-ENODEV);
+	KUNIT_EXPECT_EQ(test, pst_read(t, pst_offsets.tgt_write), 0ULL);
+	pst_drain(t);
+}
+
 static struct kunit_case pmp_start_cases[] = {
+	KUNIT_CASE(pmp_start_after_request_test),
+	KUNIT_CASE(pmp_start_after_no_ack_test),
+	KUNIT_CASE(pmp_start_after_failed_start_test),
 	KUNIT_CASE(pmp_start_t6030_deferred_external_test),
 	KUNIT_CASE(pmp_start_t6030_external_first_test),
 	KUNIT_CASE(pmp_start_ok_test),

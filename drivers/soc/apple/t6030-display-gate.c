@@ -65,16 +65,24 @@
  * states nest the other way round (the DCP's DISP_FE under DISP_CPU under
  * DISP_SYS), and its PMP power states are in another PMGR block. On every
  * T6031 boot the gate also logs what the boot loader handed over, so that
- * a boot without the option already records what the next one needs.
+ * a boot without the option already records what the next one needs. On a
+ * J516C, apple_t6031_display.ext=1 as well also describes the HDMI port,
+ * which the boot loader does not (see gate_t6031_ext_run()).
  */
 
 #define pr_fmt(fmt) fmt
 
+#include <dt-bindings/phy/phy.h>
+#include <linux/align.h>
+#include <linux/bitops.h>
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/kstrtox.h>
 #include <linux/memblock.h>
+#include <linux/minmax.h>
+#include <linux/mm.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_reserved_mem.h>
@@ -83,6 +91,7 @@
 #include <linux/sizes.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 #include <video/nomodeset.h>
 
 enum {
@@ -1959,6 +1968,1265 @@ static void __init gate_t8122_dcpext(bool panel)
 	}
 }
 
+/*
+ * T6031 external displays: the J516C HDMI port
+ *
+ * The boot loader does not describe the T6031 external display processors
+ * (dcpextN) at all. iBoot preloads the DCP firmware on every one of them and
+ * leaves its segments in memory; the boot loader exports its ADT as the
+ * phram region "adt", reserves each processor's OS log and names their
+ * firmware in /chosen/asahi,t6031-fw-uuids. With apple_t6031_display.ext=1
+ * on the kernel command line, and only once this same pass has handed the
+ * internal display and the PMP over, the gate describes dcpext0, which
+ * drives the HDMI port, from that ADT. It reads where dcpext0's segments are
+ * and ATC3's common tunables (its calibration), checks them and the device
+ * tree, and in one changeset:
+ *  - reserves the DATA and heap segments at their DART addresses, adds the
+ *    processor to the TEXT reservation it shares with the panel and names
+ *    its OS log reservation;
+ *  - adds dcpext0, its two DARTs, its mailbox and the clock its firmware is
+ *    told about, and the HDMI port as the T6030 one is described
+ *    (t603x-j514s-j516s-hdmi.dtsi): ATC3 as a DisplayPort-only PHY with the
+ *    common tunables the boot loader gives T6030's ATC3, from the ADT's
+ *    atc-phy3, the ATC3 display crossbar, the converter's GPIOs and the
+ *    graph link through which the processor puts the PHY in DisplayPort
+ *    mode;
+ *  - hands the processor to the display driver's native external path as
+ *    gate_ext_apply() does on T6030: the gate's memory and display DART
+ *    markers, a piodma child on the display DART's PIODMA stream, an active
+ *    floor on its CPU power state, and its PMP DISPEXT0 request, whose
+ *    acknowledgment the display driver waits for before it runs dcpext0;
+ *  - puts that request before dispext0's power instead of seeding it as
+ *    T6030 and T8122 do: the report entry is taken out of dispext0_fe, sets
+ *    its request only once the PMP has started (apple,request-after-start)
+ *    and becomes the second parent of dispext0_sys. The PMP thus starts as
+ *    it does without this phase, with the panel's requests alone and
+ *    dispext0 not powered by Linux; the request is set once it is ready,
+ *    and dispext0_sys, _cpu and _fe, and the DARTs, the mailbox and dcpext0
+ *    in them, probe and power up only once the PMP has acknowledged it;
+ *  - gives it a display subsystem of its own, bound by apple-drm-ext, so
+ *    that the panel's DRM device neither waits for dcpext0 nor maps its
+ *    framebuffers through dcpext0's display DART.
+ * The T6031 power states nest the other way round from T6030's: dcpext0, its
+ * DARTs and its mailbox are in dispext0_fe, under dispext0_cpu under
+ * dispext0_sys, as the panel's DCP is in disp_fe.
+ *
+ * Nothing of it is applied unless every check passes, and with
+ * apple_t6031_display.ext=0 (the default) none of this runs. The device tree
+ * must not describe any of these nodes already. Only DCPEXT0 is described:
+ * the USB-C display routes of dcpext1-3 are not.
+ */
+
+/* apple_t6031_display.ext: the external processors to describe, bit N for dcpextN. */
+static unsigned int gate_t6031_ext __initdata;
+
+/*
+ * apple_t6031_display.ext_clock: the display clock rate, in Hz, that
+ * dcpext0's firmware is told (D408). No ADT gives one for the external
+ * processors; the default is the T6030 one, unconfirmed on T6031.
+ */
+#define GATE_T6031_EXT_CLOCK		935000000
+static unsigned int gate_t6031_ext_clock __initdata = GATE_T6031_EXT_CLOCK;
+
+static int __init gate_setup_t6031_ext(char *arg)
+{
+	return arg ? kstrtouint(arg, 0, &gate_t6031_ext) : -EINVAL;
+}
+early_param("apple_t6031_display.ext", gate_setup_t6031_ext);
+
+static int __init gate_setup_t6031_ext_clock(char *arg)
+{
+	return arg ? kstrtouint(arg, 0, &gate_t6031_ext_clock) : -EINVAL;
+}
+early_param("apple_t6031_display.ext_clock", gate_setup_t6031_ext_clock);
+
+/* The outputs described: DCPEXT0's HDMI port. */
+#define GATE_T6031_EXT_OUTPUTS		BIT(0)
+
+/* DCPEXT0's display block (ADT dispext0 reg[0]) and the windows in it. */
+#define GATE_T6031_DISPEXT0		0x304000000ULL
+#define GATE_T6031_EXT_DISP_DART	0x1304000	/* dart-dispext0 reg[0] */
+#define GATE_T6031_EXT_DCP_DART		0x130c000	/* dart-dcpext0 reg[0] */
+#define GATE_T6031_EXT_VBAR		0x2850000	/* dcpext0 reg[1] */
+#define GATE_T6031_EXT_COPROC		0x2c00000	/* dcpext0 reg[0] */
+#define GATE_T6031_EXT_MBOX		0x2c08000	/* coprocessor + 0x8000 */
+/* Both DARTs share one interrupt; the mailbox has four, in ascending order. */
+#define GATE_T6031_EXT_DART_IRQ		1047
+#define GATE_T6031_EXT_MBOX_IRQ		1068
+/* The AIC's interrupt cells: <AIC_IRQ die irq IRQ_TYPE_LEVEL_HIGH>. */
+#define GATE_AIC_IRQ			0
+#define GATE_IRQ_LEVEL_HIGH		4
+
+/* DISPEXT0's PMP request: soc-device ID 18, request and acknowledge bit 17. */
+#define GATE_T6031_DISPEXT0_REQ		17
+
+/*
+ * The DART window and addresses of the segments iBoot preloads for every
+ * DCPEXT (iop-dcpextN-nub segment-ranges): the TEXT the panel's DCP runs
+ * too, DATA, the OS log, which the firmware names by physical address, and
+ * the heap, dcpext0's at the base of the heap window.
+ */
+#define GATE_T6031_FW_DVA_BASE		0x10000000000ULL	/* DART vm-base */
+#define GATE_T6031_FW_DVA_SIZE		0x1000000000ULL		/* DART vm-size */
+#define GATE_T6031_FW_TEXT_DVA		0x10040000000ULL
+#define GATE_T6031_FW_DATA_DVA		0x10080000000ULL
+#define GATE_T6031_FW_HEAP_DVA		0x100c0000000ULL
+
+enum {
+	GATE_SEG_TEXT,
+	GATE_SEG_DATA,
+	GATE_SEG_OSLOG,
+	GATE_SEG_HEAP,
+	GATE_SEG_NR,
+};
+
+static const u32 gate_t6031_seg_flags[GATE_SEG_NR] __initconst = { 0x1, 0x0, 0xa, 0x2 };
+
+/*
+ * The HDMI port: DCPEXT0 through ATC3, a fixed four-lane DisplayPort
+ * transmitter, input 0 of its display crossbar and the DP to HDMI converter
+ * (ADT atc-phy3, atc3-dpxbar, atc3-dpphy, atc3-hdmi and dp2hdmi-gpio0).
+ */
+#define GATE_T6031_ATC3			0x1303000000ULL
+#define GATE_T6031_ATC3_SIZE		0x4c000
+#define GATE_T6031_ATC3_XBAR		0x130304c000ULL
+#define GATE_T6031_HDMI_DPTX_PHY	3	/* atc3-dpphy dp-switch-dfp-endpoint */
+#define GATE_T6031_HDMI_XBAR_INPUT	0	/* dcpext0 dp-switch-ufp-endpoint */
+#define GATE_T6031_HDMI_HPD		42	/* aop-gpio0, atc3-hdmi function-hdmi_hpd */
+#define GATE_T6031_HDMI_PWREN		15	/* SMC gP0f, hdmi_pwr_en */
+#define GATE_T6031_DP2HDMI_PWREN	26	/* SMC gP1a, dp2hdmi_pwr_en */
+#define GATE_T6031_AOP_PINCTRL		"/soc/pinctrl@2a8824000"
+
+/*
+ * ATC3's common tunables ("apple,tunable-common-b"), built from the ADT's
+ * atc-phy3 as the boot loader builds them for every T8122 generation PHY
+ * (m1n1 atc_tunables_t8122), T6030's DisplayPort-only ATC3 included: these
+ * blocks in this order, each entry at its block's offset in the core window,
+ * with m1n1's block sizes; only CLKMON_CFG may be absent. The J516C's
+ * atc-phy3 has all of them. The PHY driver resets the PHY when it probes and
+ * writes these after every power-on, ahead of its own AUX, AUSPLL and lane
+ * sequences: they are all the calibration the PHY gets.
+ */
+struct gate_t6031_atc_block {
+	const char *name;
+	u32 base, size;
+	bool required;
+};
+
+static const struct gate_t6031_atc_block gate_t6031_atc3_common[] __initconst = {
+	{ "tunable_ATC_FABRIC", 0x44000, 0x4000, true },
+	{ "tunable_CIO3PLL_CORE", 0x2a00, 0x200, true },
+	{ "tunable_CIO3PLL_TOP", 0x2800, 0x200, true },
+	{ "tunable_ACIOPHY_LANE_USBC0", 0x5000, 0x1000, true },
+	{ "tunable_ACIOPHY_PLL_TOP", 0x1000, 0x4000, true },
+	{ "tunable_ACIOPHY_TOP", 0x0, 0x4000, true },
+	{ "tunable_AUSCMN_DIG", 0x800, 0x200, true },
+	{ "tunable_AUSPLL_CORE", 0x2200, 0x4000, true },
+	{ "tunable_AUX_TOP", 0x16000, 0x4000, true },
+	{ "tunable_AUSCMN_SHM", 0xa00, 0x200, true },
+	{ "tunable_CLKMON_CFG", 0x2600, 0x100, false },
+	{ "tunable_CIO_SHIM", 0x4000, 0x4000, true },
+};
+
+/* The J516C's atc-phy3 gives 93 of them. */
+#define GATE_T6031_ATC3_COMMON_MAX	128
+
+/* The nodes this phase adds; none of them may be in the device tree already. */
+static const char *const gate_t6031_ext_paths[] __initconst = {
+	"/soc/dcp@306c00000", "/soc/iommu@30530c000", "/soc/iommu@305304000",
+	"/soc/mailbox@306c08000", "/soc/phy@1303000000", "/soc/mux@130304c000",
+	"/clock-dispext0", "/dispext-subsystem",
+};
+
+/* The boot loader's ADT: a private copy of its phram "adt" export. */
+struct gate_adt {
+	const u8 *data;
+	size_t size;
+};
+
+/* DCPEXT0's preloaded segments, as the ADT gives them, 16 KiB rounded. */
+struct gate_t6031_fw {
+	u64 phys[GATE_SEG_NR];
+	u64 dva[GATE_SEG_NR];
+	u64 size[GATE_SEG_NR];
+	char uuid[37];
+};
+
+/* What the T6031 external phase found and checked, and its changeset. */
+struct gate_t6031_ext {
+	struct gate_t6031_fw fw;
+	u32 atc3_common[3 * GATE_T6031_ATC3_COMMON_MAX];
+	unsigned int nr_atc3_common;
+	struct device_node *root, *soc, *rmem, *aic;
+	struct device_node *fe, *cpu, *sys, *atc_common, *atc_usb;
+	struct device_node *aop, *smc, *entry, *text, *oslog;
+	u64 text_size;
+	const char *uuid;
+	u32 version[5];
+	int nr_version;
+
+	struct of_changeset *cs;
+	phandle next_phandle;
+	/* Nodes given a phandle in the changeset: attaching does not set it. */
+	unsigned int nr_fix;
+	struct device_node *fix[32];
+	phandle fix_phandle[32];
+	/* Nodes the changeset creates, held until the phase ends. */
+	unsigned int nr_new;
+	struct device_node *new[24];
+};
+
+/* The end of the ADT node at @off, or 0 if the node is malformed. */
+static size_t __init gate_adt_node_end(const struct gate_adt *adt, size_t off,
+				       unsigned int depth)
+{
+	u32 props, children, len, i;
+
+	if (depth > 32 || off > adt->size || adt->size - off < 8)
+		return 0;
+	props = get_unaligned_le32(adt->data + off);
+	children = get_unaligned_le32(adt->data + off + 4);
+	if (props > 4096 || children > 1024)
+		return 0;
+	off += 8;
+	for (i = 0; i < props; i++) {
+		if (adt->size - off < 36)
+			return 0;
+		len = get_unaligned_le32(adt->data + off + 32) & 0x7fffffff;
+		off += 36;
+		if (len > adt->size - off)
+			return 0;
+		off += ALIGN(len, 4);
+		if (off > adt->size)
+			return 0;
+	}
+	for (i = 0; i < children; i++) {
+		off = gate_adt_node_end(adt, off, depth + 1);
+		if (!off)
+			return 0;
+	}
+	return off;
+}
+
+/* A property of @node, a node of the tree gate_adt_load() checked. */
+static const u8 *__init gate_adt_prop(const struct gate_adt *adt, size_t node,
+				      const char *name, u32 *len)
+{
+	u32 props = get_unaligned_le32(adt->data + node), i, l;
+	size_t off = node + 8;
+
+	for (i = 0; i < props; i++) {
+		l = get_unaligned_le32(adt->data + off + 32) & 0x7fffffff;
+		if (!strncmp((const char *)adt->data + off, name, 32)) {
+			*len = l;
+			return adt->data + off + 36;
+		}
+		off += 36 + ALIGN(l, 4);
+	}
+	return NULL;
+}
+
+/* The child of @node named @name, or 0. */
+static size_t __init gate_adt_child(const struct gate_adt *adt, size_t node, const char *name)
+{
+	u32 props = get_unaligned_le32(adt->data + node);
+	u32 children = get_unaligned_le32(adt->data + node + 4);
+	size_t off = node + 8;
+	const u8 *n;
+	u32 i, len;
+
+	for (i = 0; i < props; i++)
+		off += 36 + ALIGN(get_unaligned_le32(adt->data + off + 32) & 0x7fffffff, 4);
+	for (i = 0; i < children; i++) {
+		n = gate_adt_prop(adt, off, "name", &len);
+		if (n && len && strnlen((const char *)n, len) == strlen(name) &&
+		    !memcmp(n, name, strlen(name)))
+			return off;
+		off = gate_adt_node_end(adt, off, 1);
+		if (!off)
+			return 0;
+	}
+	return 0;
+}
+
+/* Cell @idx of a u32 array property, or U32_MAX if there is none. */
+static u32 __init gate_adt_u32(const struct gate_adt *adt, size_t node, const char *name,
+			       unsigned int idx)
+{
+	const u8 *p;
+	u32 len;
+
+	p = gate_adt_prop(adt, node, name, &len);
+	return p && len / 4 > idx ? get_unaligned_le32(p + 4 * idx) : U32_MAX;
+}
+
+/* Whether the string property @name of @node starts with the string @str. */
+static bool __init gate_adt_is(const struct gate_adt *adt, size_t node, const char *name,
+			       const char *str)
+{
+	const u8 *p;
+	u32 len;
+
+	p = gate_adt_prop(adt, node, name, &len);
+	return p && len > strlen(str) && !memcmp(p, str, strlen(str) + 1);
+}
+
+/*
+ * Entry @idx of the reg of an /arm-io child, as a CPU address: /arm-io has
+ * two address and two size cells, and its ranges are {child, parent, size}.
+ */
+static int __init gate_adt_reg(const struct gate_adt *adt, size_t armio, size_t node,
+			       unsigned int idx, u64 *addr, u64 *size)
+{
+	const u8 *reg, *ranges;
+	u64 a, child, parent, span;
+	u32 len, rlen, off;
+
+	reg = gate_adt_prop(adt, node, "reg", &len);
+	ranges = gate_adt_prop(adt, armio, "ranges", &rlen);
+	if (!reg || !ranges || len / 16 <= idx)
+		return -ENOENT;
+	a = get_unaligned_le64(reg + 16 * idx);
+	*size = get_unaligned_le64(reg + 16 * idx + 8);
+	for (off = 0; off + 24 <= rlen; off += 24) {
+		child = get_unaligned_le64(ranges + off);
+		parent = get_unaligned_le64(ranges + off + 8);
+		span = get_unaligned_le64(ranges + off + 16);
+		if (a >= child && a - child < span) {
+			*addr = parent + (a - child);
+			return 0;
+		}
+	}
+	return -ERANGE;
+}
+
+/* A copy of the boot loader's phram "adt" export, checked as a whole tree. */
+static int __init gate_adt_load(struct gate_adt *adt)
+{
+	struct device_node *rmem, *np;
+	struct resource res;
+	const char *label;
+	void *map;
+	u8 *copy;
+	int ret = -ENODEV;
+
+	rmem = of_find_node_by_path("/reserved-memory");
+	for_each_child_of_node(rmem, np) {
+		if (of_device_is_compatible(np, "phram") &&
+		    !of_property_read_string(np, "label", &label) && !strcmp(label, "adt") &&
+		    !of_address_to_resource(np, 0, &res)) {
+			of_node_put(np);
+			ret = 0;
+			break;
+		}
+	}
+	of_node_put(rmem);
+	if (ret)
+		return ret;
+	if (!resource_size(&res) || resource_size(&res) > SZ_2M)
+		return -EINVAL;
+	map = memremap(res.start, resource_size(&res), MEMREMAP_WB);
+	if (!map)
+		return -ENOMEM;
+	copy = kvmalloc(resource_size(&res), GFP_KERNEL);
+	if (copy)
+		memcpy(copy, map, resource_size(&res));
+	memunmap(map);
+	if (!copy)
+		return -ENOMEM;
+	adt->data = copy;
+	adt->size = resource_size(&res);
+	if (!gate_adt_node_end(adt, 0, 0)) {
+		kvfree(copy);
+		adt->data = NULL;
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int __init gate_t6031_ext_refuse(const char *why)
+{
+	gate_warn("external displays not enabled: %s\n", why);
+	return -EINVAL;
+}
+
+/*
+ * DCPEXT0 in the ADT: its display block, processor, DARTs and interrupts
+ * where this phase puts them, and its four preloaded segments in the
+ * expected form, at the DART addresses the panel's firmware uses.
+ */
+static int __init gate_t6031_ext_adt(const struct gate_adt *adt, size_t armio,
+				     struct gate_t6031_fw *fw)
+{
+	const u64 base = GATE_T6031_DISPEXT0;
+	size_t disp, ctl, nub, dcp_dart, disp_dart;
+	u64 addr, size, phys, dva;
+	unsigned int i, irqs = 0;
+	const char *what;
+	const u8 *p;
+	u32 len, irq;
+
+	disp = gate_adt_child(adt, armio, "dispext0");
+	ctl = gate_adt_child(adt, armio, "dcpext0");
+	nub = ctl ? gate_adt_child(adt, ctl, "iop-dcpext0-nub") : 0;
+	dcp_dart = gate_adt_child(adt, armio, "dart-dcpext0");
+	disp_dart = gate_adt_child(adt, armio, "dart-dispext0");
+	what = "nodes";
+	if (!disp || !nub || !dcp_dart || !disp_dart)
+		goto bad;
+
+	what = "addresses";
+	if (gate_adt_reg(adt, armio, disp, 0, &addr, &size) || addr != base ||
+	    gate_adt_reg(adt, armio, ctl, 0, &addr, &size) ||
+	    addr != base + GATE_T6031_EXT_COPROC || size < SZ_16K ||
+	    gate_adt_reg(adt, armio, ctl, 1, &addr, &size) || addr != base + GATE_T6031_EXT_VBAR ||
+	    gate_adt_reg(adt, armio, dcp_dart, 0, &addr, &size) ||
+	    addr != base + GATE_T6031_EXT_DCP_DART ||
+	    gate_adt_reg(adt, armio, disp_dart, 0, &addr, &size) ||
+	    addr != base + GATE_T6031_EXT_DISP_DART)
+		goto bad;
+
+	what = "interrupts";
+	p = gate_adt_prop(adt, ctl, "interrupts", &len);
+	for (i = 0; p && len == 16 && i < 4; i++) {
+		irq = get_unaligned_le32(p + 4 * i);
+		if (irq - GATE_T6031_EXT_MBOX_IRQ < 4)
+			irqs |= BIT(irq - GATE_T6031_EXT_MBOX_IRQ);
+	}
+	if (irqs != 0xf ||
+	    gate_adt_u32(adt, dcp_dart, "interrupts", 0) != GATE_T6031_EXT_DART_IRQ ||
+	    gate_adt_u32(adt, disp_dart, "interrupts", 0) != GATE_T6031_EXT_DART_IRQ)
+		goto bad;
+
+	what = "firmware";
+	p = gate_adt_prop(adt, nub, "uuid", &len);
+	if (gate_adt_u32(adt, nub, "pre-loaded", 0) != 1 || !p || len < 37 ||
+	    strnlen((const char *)p, len) != 36)
+		goto bad;
+	memcpy(fw->uuid, p, 37);
+
+	what = "segments";
+	p = gate_adt_prop(adt, nub, "segment-ranges", &len);
+	if (!p || len != 32 * GATE_SEG_NR)
+		goto bad;
+	/* Each {u64 physical, u64 IOVA, u64 DART address, u32 size, u32 flags}. */
+	for (i = 0; i < GATE_SEG_NR; i++, p += 32) {
+		phys = get_unaligned_le64(p);
+		dva = get_unaligned_le64(p + 16);
+		size = ALIGN((u64)get_unaligned_le32(p + 24), SZ_16K);
+		if (get_unaligned_le32(p + 28) != gate_t6031_seg_flags[i] || !size ||
+		    size > SZ_64M || !IS_ALIGNED(phys, SZ_16K) || !IS_ALIGNED(dva, SZ_16K))
+			goto bad;
+		switch (i) {
+		case GATE_SEG_TEXT:
+			addr = GATE_T6031_FW_TEXT_DVA;
+			break;
+		case GATE_SEG_DATA:
+			addr = GATE_T6031_FW_DATA_DVA;
+			break;
+		case GATE_SEG_OSLOG:
+			addr = phys;
+			break;
+		default:
+			addr = GATE_T6031_FW_HEAP_DVA;
+			break;
+		}
+		if (dva != addr || (i != GATE_SEG_OSLOG &&
+				    (dva < GATE_T6031_FW_DVA_BASE ||
+				     dva - GATE_T6031_FW_DVA_BASE > GATE_T6031_FW_DVA_SIZE - size)))
+			goto bad;
+		fw->phys[i] = phys;
+		fw->dva[i] = dva;
+		fw->size[i] = size;
+	}
+	return 0;
+bad:
+	gate_warn("external displays not enabled: the ADT's DCPEXT0 %s are not the expected ones\n",
+		  what);
+	return -EINVAL;
+}
+
+/*
+ * ATC3's common tunables from the ADT, as {core offset, mask, value}, with
+ * the boot loader's checks (32-bit registers, aligned, inside their block)
+ * and values inside their masks.
+ */
+static int __init gate_t6031_ext_atc3(const struct gate_adt *adt, size_t armio,
+				      struct gate_t6031_ext *x)
+{
+	size_t phy = gate_adt_child(adt, armio, "atc-phy3");
+	size_t xbar = gate_adt_child(adt, armio, "atc3-dpxbar");
+	const struct gate_t6031_atc_block *blk;
+	u32 len, word, off, mask, value, *out;
+	unsigned int i, n = 0;
+	u64 addr, size;
+	const u8 *p;
+
+	if (!phy || !xbar || !gate_adt_is(adt, phy, "compatible", "atc-phy,t8122") ||
+	    gate_adt_reg(adt, armio, phy, 3, &addr, &size) || addr != GATE_T6031_ATC3 ||
+	    gate_adt_reg(adt, armio, xbar, 0, &addr, &size) || addr != GATE_T6031_ATC3_XBAR)
+		return gate_t6031_ext_refuse("the ADT's ATC3 nodes are not the expected ones");
+	for (i = 0; i < ARRAY_SIZE(gate_t6031_atc3_common); i++) {
+		blk = &gate_t6031_atc3_common[i];
+		p = gate_adt_prop(adt, phy, blk->name, &len);
+		if (!p && !blk->required)
+			continue;
+		if (!p || len % 12)
+			goto bad;
+		/* Each {u32 offset:24, size:8; u32 mask; u32 value}. */
+		for (; len; len -= 12, p += 12) {
+			word = get_unaligned_le32(p);
+			off = word & 0xffffff;
+			mask = get_unaligned_le32(p + 4);
+			value = get_unaligned_le32(p + 8);
+			if (word >> 24 != 32 || off % 4 || off + 4 > blk->size || (value & ~mask) ||
+			    n == GATE_T6031_ATC3_COMMON_MAX)
+				goto bad;
+			out = &x->atc3_common[3 * n++];
+			out[0] = blk->base + off;
+			out[1] = mask;
+			out[2] = value;
+		}
+	}
+	if (!n)
+		return gate_t6031_ext_refuse("the ADT's atc-phy3 has no common tunables");
+	x->nr_atc3_common = n;
+	return 0;
+bad:
+	gate_warn("external displays not enabled: the ADT's atc-phy3 %s is missing or not usable\n",
+		  blk->name);
+	return -EINVAL;
+}
+
+/*
+ * The TEXT reservation dcpext0 shares with the panel: one of the panel DCP's
+ * memory regions, holding that segment, mapped for the panel alone at the
+ * segment's DART address.
+ */
+static struct device_node *__init gate_t6031_ext_text(struct device_node *panel,
+						      const struct gate_t6031_fw *fw, u64 *size)
+{
+	struct resource res = {};
+	struct device_node *np;
+	const __be32 *map;
+	int i, len;
+
+	for (i = 0; (np = of_parse_phandle(panel, "memory-region", i)); i++) {
+		if (of_device_is_compatible(np, "apple,asc-mem") &&
+		    of_property_read_bool(np, "no-map") && !of_address_to_resource(np, 0, &res) &&
+		    res.start == fw->phys[GATE_SEG_TEXT] &&
+		    resource_size(&res) >= fw->size[GATE_SEG_TEXT])
+			break;
+		of_node_put(np);
+	}
+	/* One {owner, DART address, size}: the panel DCP's, two cells each under /soc. */
+	map = np ? of_get_property(np, "iommu-addresses", &len) : NULL;
+	if (!map || len != (int)(5 * sizeof(*map)) || be32_to_cpup(map) != panel->phandle ||
+	    of_read_number(map + 1, 2) != fw->dva[GATE_SEG_TEXT] ||
+	    of_read_number(map + 3, 2) != resource_size(&res)) {
+		of_node_put(np);
+		return NULL;
+	}
+	*size = resource_size(&res);
+	return np;
+}
+
+/* The boot loader's reservation of dcpext0's OS log: its own, with no DART address. */
+static struct device_node *__init gate_t6031_ext_oslog(struct device_node *rmem,
+						       struct device_node *panel,
+						       const struct gate_t6031_fw *fw)
+{
+	struct device_node *np, *found = NULL, *region;
+	struct resource res;
+	int i;
+
+	for_each_child_of_node(rmem, np) {
+		if (!of_property_read_bool(np, "apple,dcp-os-log") ||
+		    !of_property_read_bool(np, "no-map") ||
+		    of_property_present(np, "iommu-addresses") ||
+		    of_address_to_resource(np, 0, &res) || res.start != fw->phys[GATE_SEG_OSLOG] ||
+		    resource_size(&res) < fw->size[GATE_SEG_OSLOG])
+			continue;
+		if (found) {
+			of_node_put(np);
+			of_node_put(found);
+			return NULL;
+		}
+		found = of_node_get(np);
+	}
+	for (i = 0; found && (region = of_parse_phandle(panel, "memory-region", i)); i++) {
+		of_node_put(region);
+		if (region == found) {
+			of_node_put(found);
+			return NULL;
+		}
+	}
+	return found;
+}
+
+/* No memory Linux knows of, nor any reservation, overlaps [@start, @start + @size). */
+static bool __init gate_t6031_ext_unclaimed(struct device_node *rmem, u64 start, u64 size)
+{
+	struct device_node *np;
+	struct resource res;
+	int i;
+
+	if (region_intersects(start, size, IORESOURCE_MEM, IORES_DESC_NONE) != REGION_DISJOINT)
+		return false;
+	for_each_child_of_node(rmem, np) {
+		for (i = 0; !of_address_to_resource(np, i, &res); i++) {
+			if (res.start < start + size && start <= res.end) {
+				of_node_put(np);
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/* Whether @parent is among the power domains of @np. */
+static bool __init gate_ps_has_parent(struct device_node *np, struct device_node *parent)
+{
+	struct of_phandle_args args;
+	bool found = false;
+	int i, n;
+
+	n = of_count_phandle_with_args(np, "power-domains", "#power-domain-cells");
+	for (i = 0; i < n && !found; i++) {
+		if (of_parse_phandle_with_args(np, "power-domains", "#power-domain-cells", i,
+					       &args))
+			break;
+		found = args.np == parent && !args.args_count;
+		of_node_put(args.np);
+	}
+	return found;
+}
+
+/* Everything dcpext0 needs from the device tree, checked without changing anything. */
+static int __init gate_t6031_ext_resolve(struct gate_t6031_ext *x, struct device_node **np)
+{
+	const struct gate_t6031_fw *fw = &x->fw;
+	struct device_node *node;
+	const char *s, *panel_uuid = NULL;
+	struct property *prop;
+	unsigned int i;
+	u32 cells, id;
+	bool ok;
+
+	x->root = of_find_node_by_path("/");
+	x->soc = of_find_node_by_path("/soc");
+	x->rmem = of_find_node_by_path("/reserved-memory");
+	/* Every node and reservation added is written with two-cell addresses. */
+	if (!x->root || !x->soc || !x->rmem || !of_chosen || np[GATE_DCP]->parent != x->soc ||
+	    of_property_read_u32(x->soc, "#address-cells", &cells) || cells != 2 ||
+	    of_property_read_u32(x->soc, "#size-cells", &cells) || cells != 2 ||
+	    of_property_read_u32(x->rmem, "#address-cells", &cells) || cells != 2 ||
+	    of_property_read_u32(x->rmem, "#size-cells", &cells) || cells != 2)
+		return gate_t6031_ext_refuse("/soc or /reserved-memory not as expected");
+
+	for (i = 0; i < ARRAY_SIZE(gate_t6031_ext_paths); i++) {
+		node = of_find_node_by_path(gate_t6031_ext_paths[i]);
+		of_node_put(node);
+		if (node) {
+			gate_warn("external displays not enabled: the device tree has %s already\n",
+				  gate_t6031_ext_paths[i]);
+			return -EEXIST;
+		}
+	}
+	node = of_find_compatible_node(NULL, NULL, "apple,t6031-dcpext");
+	if (!node)
+		node = of_find_compatible_node(NULL, NULL, "apple,t6031-dispext-subsystem");
+	of_node_put(node);
+	if (node)
+		return gate_t6031_ext_refuse("the device tree has a T6031 dcpext already");
+
+	/* The interrupt controller of the panel's mailbox, for the nodes added. */
+	x->aic = of_parse_phandle(np[GATE_DCP_MBOX], "interrupt-parent", 0);
+	if (!x->aic || !x->aic->phandle ||
+	    !of_property_read_bool(x->aic, "interrupt-controller") ||
+	    of_property_read_u32(x->aic, "#interrupt-cells", &cells) || cells != 4)
+		return gate_t6031_ext_refuse("no four-cell AIC parent for the panel's mailbox");
+
+	/* The firmware: the panel's 14.7.0 image, as the boot loader and the ADT name it. */
+	of_property_for_each_string(of_chosen, "asahi,t6031-fw-uuids", prop, s)
+		if (strstarts(s, "dcpext0="))
+			x->uuid = s + strlen("dcpext0=");
+	of_property_read_string(np[GATE_DCP], "apple,firmware-uuid", &panel_uuid);
+	x->nr_version = of_property_read_variable_u32_array(np[GATE_DCP], "apple,firmware-version",
+							    x->version, 3,
+							    ARRAY_SIZE(x->version));
+	if (!x->uuid || !panel_uuid || strcmp(x->uuid, fw->uuid) || strcmp(x->uuid, panel_uuid) ||
+	    !gate_ext_firmware_ok(np[GATE_DCP]) || x->nr_version < 3)
+		return gate_t6031_ext_refuse("DCPEXT0's firmware is not the panel's 14.7.0 image");
+
+	/*
+	 * dispext0_fe under dispext0_cpu under dispext0_sys, as the panel's,
+	 * and dispext0_sys under one other power state: the request becomes
+	 * its second parent.
+	 */
+	x->fe = gate_ps_unique("dispext0_fe");
+	x->cpu = gate_ps_unique("dispext0_cpu");
+	x->sys = gate_ps_unique("dispext0_sys");
+	node = x->fe ? gate_ps_parent(x->fe) : NULL;
+	ok = node && node == x->cpu;
+	of_node_put(node);
+	node = x->cpu ? gate_ps_parent(x->cpu) : NULL;
+	ok = ok && node && node == x->sys;
+	of_node_put(node);
+	node = x->sys ? gate_ps_parent(x->sys) : NULL;
+	ok = ok && node;
+	of_node_put(node);
+	if (!ok)
+		return gate_t6031_ext_refuse("dispext0_fe, _cpu and _sys do not nest as expected");
+	x->atc_common = gate_ps_unique("atc3_common");
+	x->atc_usb = gate_ps_unique("atc3_usb");
+	if (!x->atc_common || !x->atc_usb || !gate_ps_has_parent(x->atc_usb, x->atc_common))
+		return gate_t6031_ext_refuse("no atc3_usb power state under atc3_common");
+
+	/* The converter's hotplug pin and supplies. */
+	x->aop = of_find_node_by_path(GATE_T6031_AOP_PINCTRL);
+	x->smc = gate_find_one("apple,smc-gpio");
+	if (!x->aop || !x->smc || !of_device_is_compatible(x->aop, "apple,t6031-pinctrl") ||
+	    !of_property_read_bool(x->aop, "gpio-controller") ||
+	    !of_property_read_bool(x->aop, "interrupt-controller") ||
+	    of_property_read_u32(x->aop, "#gpio-cells", &cells) || cells != 2 ||
+	    of_property_read_u32(x->aop, "apple,npins", &cells) || cells <= GATE_T6031_HDMI_HPD ||
+	    !of_property_read_bool(x->smc, "gpio-controller") ||
+	    of_property_read_u32(x->smc, "#gpio-cells", &cells) || cells != 2)
+		return gate_t6031_ext_refuse("no AOP pins or SMC GPIOs for the HDMI converter");
+
+	/*
+	 * Its PMP request, disabled until now, acknowledged by the PMP, not
+	 * seeded, a power domain of its own and in dispext0_fe alone, which the
+	 * changeset takes it out of.
+	 */
+	x->entry = gate_pmp_dispext_entry(0);
+	node = x->entry ? gate_ps_parent(x->entry) : NULL;
+	of_node_put(node);
+	if (!x->entry || !gate_disabled(x->entry) || node != x->fe ||
+	    !of_device_is_compatible(x->entry, "apple,t6000-pmp-v2-report-entry") ||
+	    of_property_read_u32(x->entry, "reg", &id) || id != GATE_T6031_DISPEXT0_REQ ||
+	    of_property_read_u32(x->entry, "#power-domain-cells", &cells) || cells ||
+	    of_property_read_bool(x->entry, "apple,no-ack") ||
+	    of_property_read_bool(x->entry, "apple,soc-device-record") ||
+	    of_property_read_bool(x->entry, "apple,always-on") ||
+	    of_property_read_bool(x->entry, "apple,request-after-start"))
+		return gate_t6031_ext_refuse("DCPEXT0's PMP request is not as expected");
+
+	/* TEXT shared with the panel, its own OS log, DATA and heap nobody's. */
+	x->text = gate_t6031_ext_text(np[GATE_DCP], fw, &x->text_size);
+	x->oslog = gate_t6031_ext_oslog(x->rmem, np[GATE_DCP], fw);
+	if (!x->text || !x->oslog)
+		return gate_t6031_ext_refuse("DCPEXT0's TEXT or OS log is not reserved");
+	if (!gate_t6031_ext_unclaimed(x->rmem, fw->phys[GATE_SEG_DATA], fw->size[GATE_SEG_DATA]) ||
+	    !gate_t6031_ext_unclaimed(x->rmem, fw->phys[GATE_SEG_HEAP], fw->size[GATE_SEG_HEAP]) ||
+	    (fw->phys[GATE_SEG_DATA] < fw->phys[GATE_SEG_HEAP] + fw->size[GATE_SEG_HEAP] &&
+	     fw->phys[GATE_SEG_HEAP] < fw->phys[GATE_SEG_DATA] + fw->size[GATE_SEG_DATA]))
+		return gate_t6031_ext_refuse("DCPEXT0's DATA or heap overlaps known memory");
+	return 0;
+}
+
+/* The first phandle no node has. */
+static phandle __init gate_free_phandle(void)
+{
+	struct device_node *np;
+	phandle last = 0;
+
+	for_each_of_allnodes(np)
+		last = max(last, np->phandle);
+	return last + 1;
+}
+
+/* @np's phandle; a node without one gets the next free one, in the changeset. */
+static int __init gate_x_phandle(struct gate_t6031_ext *x, struct device_node *np, phandle *ph)
+{
+	unsigned int i;
+
+	if (np->phandle) {
+		*ph = np->phandle;
+		return 0;
+	}
+	for (i = 0; i < x->nr_fix; i++) {
+		if (x->fix[i] == np) {
+			*ph = x->fix_phandle[i];
+			return 0;
+		}
+	}
+	if (x->nr_fix == ARRAY_SIZE(x->fix))
+		return -ENOSPC;
+	*ph = x->next_phandle++;
+	x->fix[x->nr_fix] = np;
+	x->fix_phandle[x->nr_fix++] = *ph;
+	return of_changeset_add_prop_u32(x->cs, np, "phandle", *ph);
+}
+
+/* A new node @name under @parent, with a phandle if @ph is set, or NULL. */
+static struct device_node *__init gate_x_node(struct gate_t6031_ext *x,
+					      struct device_node *parent, const char *name,
+					      phandle *ph)
+{
+	struct device_node *np;
+
+	if (!parent || x->nr_new == ARRAY_SIZE(x->new))
+		return NULL;
+	np = of_changeset_create_node(x->cs, parent, name);
+	if (!np)
+		return NULL;
+	x->new[x->nr_new++] = np;
+	if (ph && gate_x_phandle(x, np, ph))
+		return NULL;
+	return np;
+}
+
+/* @name set to @cells, or with @cells appended to its current value. */
+static int __init gate_x_cells(struct gate_t6031_ext *x, struct device_node *np, const char *name,
+			       const u32 *cells, unsigned int count, bool append)
+{
+	const struct property *old = of_find_property(np, name, NULL);
+	size_t keep = append && old ? old->length : 0;
+	struct property *prop;
+	unsigned int i;
+	__be32 *val;
+
+	if (keep % sizeof(*val))
+		return -EINVAL;
+	/* Kept for good: the live tree refers to it once applied. */
+	prop = kzalloc_obj(*prop);
+	val = kmalloc(keep + count * sizeof(*val), GFP_KERNEL);
+	if (!prop || !val) {
+		kfree(prop);
+		kfree(val);
+		return -ENOMEM;
+	}
+	if (keep)
+		memcpy(val, old->value, keep);
+	for (i = 0; i < count; i++)
+		val[keep / sizeof(*val) + i] = cpu_to_be32(cells[i]);
+	prop->name = (char *)name;
+	prop->value = val;
+	prop->length = keep + count * sizeof(*val);
+	return old ? of_changeset_update_property(x->cs, np, prop) :
+		     of_changeset_add_property(x->cs, np, prop);
+}
+
+/* Removes the property @name, which @np must have. */
+static int __init gate_x_remove(struct gate_t6031_ext *x, struct device_node *np,
+				const char *name)
+{
+	struct property *prop = of_find_property(np, name, NULL);
+
+	return prop ? of_changeset_remove_property(x->cs, np, prop) : -ENOENT;
+}
+
+/* {address, size} as two-cell numbers. */
+static void __init gate_x_pair(u32 *cells, u64 addr, u64 size)
+{
+	cells[0] = upper_32_bits(addr);
+	cells[1] = lower_32_bits(addr);
+	cells[2] = upper_32_bits(size);
+	cells[3] = lower_32_bits(size);
+}
+
+/* "reg" with one {@addr, @size}. */
+static int __init gate_x_reg(struct gate_t6031_ext *x, struct device_node *np, u64 addr,
+			     u64 size)
+{
+	u32 reg[4];
+
+	gate_x_pair(reg, addr, size);
+	return of_changeset_add_prop_u32_array(x->cs, np, "reg", reg, ARRAY_SIZE(reg));
+}
+
+/* @count AIC interrupts from @first, level high. */
+static int __init gate_x_irqs(struct gate_t6031_ext *x, struct device_node *np, u32 first,
+			      unsigned int count)
+{
+	u32 cells[4 * 4];
+	unsigned int i;
+
+	if (count > 4)
+		return -EINVAL;
+	for (i = 0; i < count; i++) {
+		cells[4 * i] = GATE_AIC_IRQ;
+		cells[4 * i + 1] = 0;
+		cells[4 * i + 2] = first + i;
+		cells[4 * i + 3] = GATE_IRQ_LEVEL_HIGH;
+	}
+	return of_changeset_add_prop_u32(x->cs, np, "interrupt-parent", x->aic->phandle) ?:
+	       of_changeset_add_prop_u32_array(x->cs, np, "interrupts", cells, 4 * count);
+}
+
+/* A DART of dcpext0's display block, at @addr, powered by @ps. */
+static int __init gate_x_dart(struct gate_t6031_ext *x, struct device_node *np, u64 addr,
+			      phandle ps)
+{
+	static const char *const compat[] = { "apple,t6031-dart", "apple,t8110-dart" };
+	static const u32 dma_range[] = { 0x100, 0x0, 0x10, 0x0 };
+
+	return of_changeset_add_prop_string_array(x->cs, np, "compatible", compat,
+						  ARRAY_SIZE(compat)) ?:
+	       gate_x_reg(x, np, addr, SZ_16K) ?:
+	       gate_x_irqs(x, np, GATE_T6031_EXT_DART_IRQ, 1) ?:
+	       of_changeset_add_prop_u32(x->cs, np, "#iommu-cells", 1) ?:
+	       of_changeset_add_prop_u32_array(x->cs, np, "apple,dma-range", dma_range,
+					       ARRAY_SIZE(dma_range)) ?:
+	       of_changeset_add_prop_u32(x->cs, np, "power-domains", ps);
+}
+
+/* A new no-map reservation of a dcpext0 segment, at its DART address for @owner. */
+static int __init gate_x_reserve(struct gate_t6031_ext *x, const char *what, unsigned int seg,
+				 phandle owner, phandle *ph)
+{
+	struct device_node *np;
+	char name[48];
+	u32 map[5];
+
+	snprintf(name, sizeof(name), "dcpext0-%s@%llx", what, x->fw.phys[seg]);
+	np = gate_x_node(x, x->rmem, name, ph);
+	if (!np)
+		return -ENOMEM;
+	map[0] = owner;
+	gate_x_pair(map + 1, x->fw.dva[seg], x->fw.size[seg]);
+	return of_changeset_add_prop_string(x->cs, np, "compatible", "apple,asc-mem") ?:
+	       of_changeset_add_prop_bool(x->cs, np, "no-map") ?:
+	       gate_x_reg(x, np, x->fw.phys[seg], x->fw.size[seg]) ?:
+	       of_changeset_add_prop_u32_array(x->cs, np, "iommu-addresses", map,
+					       ARRAY_SIZE(map));
+}
+
+/*
+ * A one-port graph between dcpext0 (port 1, its DisplayPort output) and ATC3
+ * (port 2, its DisplayPort input), as on T6030: the processor finds the
+ * PHY's mode switch through it.
+ */
+static struct device_node *__init gate_x_port(struct gate_t6031_ext *x, struct device_node *np,
+					      u32 port, phandle *ph)
+{
+	struct device_node *ports, *node;
+	char name[16];
+
+	ports = gate_x_node(x, np, "ports", NULL);
+	snprintf(name, sizeof(name), "port@%u", port);
+	node = gate_x_node(x, ports, name, NULL);
+	if (!ports || !node ||
+	    of_changeset_add_prop_u32(x->cs, ports, "#address-cells", 1) ||
+	    of_changeset_add_prop_u32(x->cs, ports, "#size-cells", 0) ||
+	    of_changeset_add_prop_u32(x->cs, node, "reg", port))
+		return NULL;
+	return gate_x_node(x, node, "endpoint", ph);
+}
+
+/* The changeset: see the description above gate_t6031_ext_paths. */
+static int __init gate_t6031_ext_build(struct gate_t6031_ext *x, struct device_node **subsys)
+{
+	static const char *const mbox_compat[] = { "apple,t6031-asc-mailbox",
+						   "apple,asc-mailbox-v4" };
+	static const char *const mbox_irqs[] = { "send-empty", "send-not-empty",
+						 "recv-empty", "recv-not-empty" };
+	static const char *const phy_compat[] = { "apple,t6031-atcphy", "apple,t8122-atcphy" };
+	static const char *const xbar_compat[] = { "apple,t6031-display-crossbar",
+						   "apple,t6020-display-crossbar" };
+	static const char *const dcp_compat[] = { "apple,t6031-dcpext", "apple,dcpext" };
+	static const char *const regions[] = { "asc-firmware", "dcp_data", "os_log", "heap" };
+	static const u32 fw_compat[] = { 14, 7, 0 };
+	const u64 base = GATE_T6031_DISPEXT0;
+	struct device_node *dcpext, *dcp_dart, *disp_dart, *mbox, *phy, *xbar, *clk;
+	struct device_node *dcp_ep, *phy_ep, *piodma;
+	phandle fe, atc_common, atc_usb, aop, smc, entry, region[GATE_SEG_NR];
+	phandle ph_dcpext, ph_dcp_dart, ph_disp_dart, ph_mbox, ph_phy, ph_xbar, ph_clk;
+	phandle ph_dcp_ep = 0, ph_phy_ep = 0;
+	u32 cells[5];
+	int ret;
+
+	/* The nodes the new ones refer to. */
+	ret = gate_x_phandle(x, x->fe, &fe) ?:
+	      gate_x_phandle(x, x->atc_common, &atc_common) ?:
+	      gate_x_phandle(x, x->atc_usb, &atc_usb) ?:
+	      gate_x_phandle(x, x->aop, &aop) ?:
+	      gate_x_phandle(x, x->smc, &smc) ?:
+	      gate_x_phandle(x, x->entry, &entry) ?:
+	      gate_x_phandle(x, x->text, &region[GATE_SEG_TEXT]) ?:
+	      gate_x_phandle(x, x->oslog, &region[GATE_SEG_OSLOG]);
+	if (ret)
+		return ret;
+
+	/* The new nodes, and the phandles they refer to each other by. */
+	dcpext = gate_x_node(x, x->soc, "dcp@306c00000", &ph_dcpext);
+	dcp_dart = gate_x_node(x, x->soc, "iommu@30530c000", &ph_dcp_dart);
+	disp_dart = gate_x_node(x, x->soc, "iommu@305304000", &ph_disp_dart);
+	mbox = gate_x_node(x, x->soc, "mailbox@306c08000", &ph_mbox);
+	phy = gate_x_node(x, x->soc, "phy@1303000000", &ph_phy);
+	xbar = gate_x_node(x, x->soc, "mux@130304c000", &ph_xbar);
+	clk = gate_x_node(x, x->root, "clock-dispext0", &ph_clk);
+	dcp_ep = dcpext ? gate_x_port(x, dcpext, 1, &ph_dcp_ep) : NULL;
+	phy_ep = phy ? gate_x_port(x, phy, 2, &ph_phy_ep) : NULL;
+	piodma = gate_x_node(x, dcpext, "piodma", NULL);
+	*subsys = gate_x_node(x, x->root, "dispext-subsystem", NULL);
+	if (!dcpext || !dcp_dart || !disp_dart || !mbox || !phy || !xbar || !clk ||
+	    !dcp_ep || !phy_ep || !piodma || !*subsys)
+		return -ENOMEM;
+
+	/* DATA and heap, new; TEXT, the panel's, mapped for dcpext0 too. */
+	cells[0] = ph_dcpext;
+	gate_x_pair(cells + 1, GATE_T6031_FW_TEXT_DVA, x->text_size);
+	ret = gate_x_reserve(x, "data", GATE_SEG_DATA, ph_dcpext, &region[GATE_SEG_DATA]) ?:
+	      gate_x_reserve(x, "heap", GATE_SEG_HEAP, ph_dcpext, &region[GATE_SEG_HEAP]) ?:
+	      gate_x_cells(x, x->text, "iommu-addresses", cells, 5, true);
+	if (ret)
+		return ret;
+
+	/* The clock the firmware is told, the DARTs and the mailbox, all in dispext0_fe. */
+	ret = of_changeset_add_prop_string(x->cs, clk, "compatible", "fixed-clock") ?:
+	      of_changeset_add_prop_u32(x->cs, clk, "#clock-cells", 0) ?:
+	      of_changeset_add_prop_u32(x->cs, clk, "clock-frequency", gate_t6031_ext_clock) ?:
+	      of_changeset_add_prop_string(x->cs, clk, "clock-output-names", "clk_dispext0") ?:
+	      gate_x_dart(x, dcp_dart, base + GATE_T6031_EXT_DCP_DART, fe) ?:
+	      gate_x_dart(x, disp_dart, base + GATE_T6031_EXT_DISP_DART, fe) ?:
+	      of_changeset_add_prop_string_array(x->cs, mbox, "compatible", mbox_compat,
+						 ARRAY_SIZE(mbox_compat)) ?:
+	      gate_x_reg(x, mbox, base + GATE_T6031_EXT_MBOX, SZ_16K) ?:
+	      gate_x_irqs(x, mbox, GATE_T6031_EXT_MBOX_IRQ, 4) ?:
+	      of_changeset_add_prop_string_array(x->cs, mbox, "interrupt-names", mbox_irqs,
+						 ARRAY_SIZE(mbox_irqs)) ?:
+	      of_changeset_add_prop_u32(x->cs, mbox, "power-domains", fe) ?:
+	      of_changeset_add_prop_u32(x->cs, mbox, "#mbox-cells", 0);
+	if (ret)
+		return ret;
+
+	/*
+	 * ATC3 as T6030's: only its core window, so the PHY driver runs it
+	 * DisplayPort-only, with the common tunables the boot loader would give
+	 * it. Its crossbar sits in atc3_usb, whose parents are atc3_usb_aon and
+	 * atc3_common: the two power states the ADT gives atc-phy3.
+	 */
+	ret = of_changeset_add_prop_string_array(x->cs, phy, "compatible", phy_compat,
+						 ARRAY_SIZE(phy_compat)) ?:
+	      gate_x_reg(x, phy, GATE_T6031_ATC3, GATE_T6031_ATC3_SIZE) ?:
+	      of_changeset_add_prop_string(x->cs, phy, "reg-names", "core") ?:
+	      of_changeset_add_prop_u32(x->cs, phy, "#phy-cells", 1) ?:
+	      of_changeset_add_prop_u32(x->cs, phy, "#reset-cells", 0) ?:
+	      of_changeset_add_prop_bool(x->cs, phy, "orientation-switch") ?:
+	      of_changeset_add_prop_bool(x->cs, phy, "mode-switch") ?:
+	      of_changeset_add_prop_u32(x->cs, phy, "power-domains", atc_common) ?:
+	      of_changeset_add_prop_u32_array(x->cs, phy, "apple,tunable-common-b",
+					      x->atc3_common, 3 * x->nr_atc3_common) ?:
+	      of_changeset_add_prop_u32(x->cs, phy_ep, "remote-endpoint", ph_dcp_ep) ?:
+	      of_changeset_add_prop_string_array(x->cs, xbar, "compatible", xbar_compat,
+						 ARRAY_SIZE(xbar_compat)) ?:
+	      gate_x_reg(x, xbar, GATE_T6031_ATC3_XBAR, SZ_16K) ?:
+	      of_changeset_add_prop_u32(x->cs, xbar, "#mux-control-cells", 1) ?:
+	      of_changeset_add_prop_u32(x->cs, xbar, "power-domains", atc_usb);
+	if (ret)
+		return ret;
+
+	/* dcpext0 and its HDMI output, as the T6030 HDMI port's dcpext. */
+	cells[0] = ph_dcp_dart;
+	cells[1] = 5;
+	ret = of_changeset_add_prop_string_array(x->cs, dcpext, "compatible", dcp_compat,
+						 ARRAY_SIZE(dcp_compat)) ?:
+	      gate_x_reg(x, dcpext, base + GATE_T6031_EXT_COPROC, SZ_16K) ?:
+	      of_changeset_add_prop_string(x->cs, dcpext, "reg-names", "coproc") ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "mboxes", ph_mbox) ?:
+	      of_changeset_add_prop_string(x->cs, dcpext, "mbox-names", "mbox") ?:
+	      of_changeset_add_prop_u32_array(x->cs, dcpext, "iommus", cells, 2) ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "power-domains", fe) ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "clocks", ph_clk) ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "apple,dcp-index", 1) ?:
+	      of_changeset_add_prop_string(x->cs, dcpext, "apple,connector-type", "HDMI-A") ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "#address-cells", 2) ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "#size-cells", 2) ?:
+	      of_changeset_add_prop_bool(x->cs, dcpext, "ranges");
+	if (ret)
+		return ret;
+	cells[0] = ph_phy;
+	cells[1] = PHY_TYPE_DP;
+	ret = of_changeset_add_prop_u32_array(x->cs, dcpext, "phys", cells, 2) ?:
+	      of_changeset_add_prop_string(x->cs, dcpext, "phy-names", "dp-phy");
+	cells[0] = ph_xbar;
+	cells[1] = 0;
+	ret = ret ?:
+	      of_changeset_add_prop_u32_array(x->cs, dcpext, "mux-controls", cells, 2) ?:
+	      of_changeset_add_prop_string(x->cs, dcpext, "mux-control-names", "dp-xbar") ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "mux-index", GATE_T6031_HDMI_XBAR_INPUT) ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "apple,dptx-phy", GATE_T6031_HDMI_DPTX_PHY);
+	cells[0] = aop;
+	cells[1] = GATE_T6031_HDMI_HPD;
+	cells[2] = 0;		/* GPIO_ACTIVE_HIGH */
+	ret = ret ?: of_changeset_add_prop_u32_array(x->cs, dcpext, "hdmi-hpd-gpios", cells, 3);
+	cells[0] = smc;
+	cells[1] = GATE_T6031_HDMI_PWREN;
+	ret = ret ?: of_changeset_add_prop_u32_array(x->cs, dcpext, "hdmi-pwren-gpios", cells, 3);
+	cells[1] = GATE_T6031_DP2HDMI_PWREN;
+	ret = ret ?: of_changeset_add_prop_u32_array(x->cs, dcpext, "dp2hdmi-pwren-gpios",
+						     cells, 3);
+	ret = ret ?: of_changeset_add_prop_u32(x->cs, dcp_ep, "remote-endpoint", ph_phy_ep);
+	if (ret)
+		return ret;
+
+	/*
+	 * Its firmware, memory and PMP request, handed to the display driver's
+	 * native external path with the gate's markers, as on T6030; the
+	 * driver checks and maps the memory itself before it runs dcpext0.
+	 * The request is not seeded, so that the PMP start, which the panel
+	 * needs, is the same as without dcpext0: its entry sets it only once
+	 * the PMP has started (apple,request-after-start), and it comes before
+	 * dispext0's power, as the parent of dispext0_sys instead of a child of
+	 * dispext0_fe. Until the PMP has acknowledged it, the entry provides no
+	 * power domain: genpd defers dispext0_sys, _cpu and _fe, and the DARTs,
+	 * the mailbox and dcpext0 in them, so nothing powers dispext0 up, and
+	 * fw_devlink (on by default) holds their probes, so PMGR writes
+	 * dispext0_cpu's floor, when that domain probes, only after it too.
+	 */
+	cells[0] = ph_disp_dart;
+	cells[1] = 4;
+	ret = of_changeset_add_prop_u32_array(x->cs, dcpext, "memory-region", region,
+					      ARRAY_SIZE(region)) ?:
+	      of_changeset_add_prop_string_array(x->cs, dcpext, "memory-region-names", regions,
+						 ARRAY_SIZE(regions)) ?:
+	      of_changeset_add_prop_u32_array(x->cs, dcpext, "apple,firmware-compat", fw_compat,
+					      ARRAY_SIZE(fw_compat)) ?:
+	      of_changeset_add_prop_u32_array(x->cs, dcpext, "apple,firmware-version", x->version,
+					      x->nr_version) ?:
+	      of_changeset_add_prop_string(x->cs, dcpext, "apple,firmware-uuid", x->uuid) ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "apple,pmp-report", entry) ?:
+	      of_changeset_add_prop_u32(x->cs, dcpext, "apple,t6030-dcpext-memory-ready", 1) ?:
+	      of_changeset_add_prop_u32_array(x->cs, piodma, "iommus", cells, 2) ?:
+	      of_changeset_add_prop_u32(x->cs, piodma, "apple,t6030-dispext-handoff", 1) ?:
+	      of_changeset_update_prop_string(x->cs, x->entry, "status", "okay") ?:
+	      gate_add_bool(x->cs, x->entry, "apple,request-after-start") ?:
+	      gate_x_remove(x, x->entry, "power-domains") ?:
+	      gate_x_cells(x, x->sys, "power-domains", &entry, 1, true) ?:
+	      /* The active floor the display driver checks before it runs dcpext0. */
+	      gate_set_u32(x->cs, x->cpu, "apple,min-state", PMGR_PS_ACTIVE) ?:
+	      /* As on T6030: no USB consumer holds ATC3 on across system sleep. */
+	      gate_add_bool(x->cs, x->atc_common, "apple,always-on");
+	if (ret)
+		return ret;
+
+	/* Its own display subsystem: scanout through its display DART alone. */
+	cells[1] = 0;
+	return of_changeset_add_prop_string(x->cs, *subsys, "compatible",
+					    "apple,t6031-dispext-subsystem") ?:
+	       of_changeset_add_prop_u32_array(x->cs, *subsys, "iommus", cells, 2) ?:
+	       of_changeset_add_prop_u32(x->cs, *subsys, "apple,dcps", ph_dcpext);
+}
+
+static void __init gate_t6031_ext_put(struct gate_t6031_ext *x)
+{
+	unsigned int i;
+
+	for (i = 0; i < x->nr_new; i++)
+		of_node_put(x->new[i]);
+	of_node_put(x->oslog);
+	of_node_put(x->text);
+	of_node_put(x->entry);
+	of_node_put(x->smc);
+	of_node_put(x->aop);
+	of_node_put(x->atc_usb);
+	of_node_put(x->atc_common);
+	of_node_put(x->sys);
+	of_node_put(x->cpu);
+	of_node_put(x->fe);
+	of_node_put(x->aic);
+	of_node_put(x->rmem);
+	of_node_put(x->soc);
+	of_node_put(x->root);
+}
+
+/* The external display phase; @np are the panel's nodes when @panel. */
+static void __init gate_t6031_ext_run(bool panel, struct device_node **np)
+{
+	struct device_node *subsys = NULL;
+	struct gate_adt adt = {};
+	struct gate_t6031_ext *x;
+	size_t armio;
+	unsigned int i;
+	int ret;
+
+	if (!gate_t6031_ext)
+		return;
+	if (!panel) {
+		gate_warn("external displays not enabled: apple_t6031_display.ext needs the internal display and the PMP handed over in the same boot\n");
+		return;
+	}
+	if (gate_t6031_ext & ~GATE_T6031_EXT_OUTPUTS) {
+		gate_warn("external displays not enabled: apple_t6031_display.ext=%#x, only 0x1 (DCPEXT0, the HDMI port) is described\n",
+			  gate_t6031_ext);
+		return;
+	}
+	if (!of_machine_is_compatible("apple,j516c")) {
+		gate_t6031_ext_refuse("only the J516C HDMI port is described");
+		return;
+	}
+	if (!gate_t6031_ext_clock || gate_t6031_ext_clock > 2000000000) {
+		gate_warn("external displays not enabled: apple_t6031_display.ext_clock=%u Hz is out of range\n",
+			  gate_t6031_ext_clock);
+		return;
+	}
+	if (!IS_ENABLED(CONFIG_DRM_APPLE)) {
+		gate_t6031_ext_refuse("the display driver is not built");
+		return;
+	}
+	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only()) {
+		gate_t6031_ext_refuse("nomodeset is on the command line");
+		return;
+	}
+
+	x = kzalloc_obj(*x);
+	if (!x)
+		return;
+	ret = gate_adt_load(&adt);
+	if (ret) {
+		gate_warn("external displays not enabled: no readable boot loader ADT (%d)\n", ret);
+		goto out;
+	}
+	armio = gate_adt_child(&adt, 0, "arm-io");
+	if (!armio || gate_adt_u32(&adt, armio, "#address-cells", 0) != 2 ||
+	    gate_adt_u32(&adt, armio, "#size-cells", 0) != 2) {
+		ret = gate_t6031_ext_refuse("the ADT has no two-cell /arm-io");
+		goto out;
+	}
+	ret = gate_t6031_ext_adt(&adt, armio, &x->fw);
+	if (!ret)
+		ret = gate_t6031_ext_atc3(&adt, armio, x);
+	if (!ret)
+		ret = gate_t6031_ext_resolve(x, np);
+	if (ret)
+		goto out;
+
+	x->cs = gate_cs_alloc();
+	if (!x->cs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	x->next_phandle = gate_free_phandle();
+	ret = gate_t6031_ext_build(x, &subsys);
+	if (!ret)
+		ret = of_changeset_apply(x->cs);
+	if (ret) {
+		/* Nothing applied: the changeset's nodes and properties are dropped. */
+		gate_cs_free(x->cs);
+		gate_warn("external displays not enabled: changeset failed: %d\n", ret);
+		goto out;
+	}
+	/* Attaching a node, or adding a "phandle", does not set the node's phandle. */
+	for (i = 0; i < x->nr_fix; i++)
+		x->fix[i]->phandle = x->fix_phandle[i];
+
+	gate_info("DCPEXT0: firmware %s preloaded; DATA %#llx and heap %#llx reserved, OS log %#llx; PMP request %pOF (bit %d) set once the PMP has started, the parent of %pOF\n",
+		  x->fw.uuid, x->fw.phys[GATE_SEG_DATA], x->fw.phys[GATE_SEG_HEAP],
+		  x->fw.phys[GATE_SEG_OSLOG], x->entry, GATE_T6031_DISPEXT0_REQ, x->sys);
+	gate_info("external displays enabled: dcpext0 for the HDMI port, %u nodes added, %u ATC3 common tunables, display clock %u Hz, DRM device %pOF; the PMP starts with the panel's requests alone, and dispext0 powers up once the PMP has acknowledged DISPEXT0\n",
+		  x->nr_new, x->nr_atc3_common, gate_t6031_ext_clock, subsys);
+out:
+	if (ret)
+		gate_info("no external displays this boot (%d); the internal display is not affected\n",
+			  ret);
+	gate_t6031_ext_put(x);
+	kvfree(adt.data);
+	kfree(x);
+}
+
 static void __init gate_run(void)
 {
 	struct device_node *np[GATE_NR_NODES] = {};
@@ -1987,6 +3255,8 @@ static void __init gate_run(void)
 			gate_info("disabled on the command line, display stays on the boot framebuffer\n");
 		if (gate_soc->dcpext)
 			gate_dcpext("the display gate is disabled");
+		if (gate_soc == &gate_t6031)
+			gate_t6031_ext_run(false, NULL);
 		return;
 	}
 
@@ -2001,6 +3271,8 @@ static void __init gate_run(void)
 		gate_dcpext(panel ? NULL : "the internal display was not handed over");
 	if (gate_soc == &gate_t8122)
 		gate_t8122_dcpext(panel);
+	if (gate_soc == &gate_t6031)
+		gate_t6031_ext_run(panel, np);
 	gate_reuse_put();
 	of_node_put(aic);
 	for (i = 0; i < PMP_PS_NR; i++)

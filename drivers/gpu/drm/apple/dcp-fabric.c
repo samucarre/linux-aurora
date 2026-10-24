@@ -1763,7 +1763,9 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	struct mux_control *xbar = NULL;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,t6030"))
+	/* T6030, and the J516C HDMI port, whose crossbar is driven as T6030's. */
+	if (!of_machine_is_compatible("apple,t6030") &&
+	    !of_device_is_compatible(dcp->dev->of_node, "apple,t6031-dcpext"))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
 	route = dcp->active_typec_route;

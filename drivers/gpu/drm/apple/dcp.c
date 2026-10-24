@@ -1377,10 +1377,23 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 }
 
 /*
+ * The external processors driven in the 14.7 external role: T6030's, and
+ * T6031's dcpext0 (the J516C HDMI port), which the display gate describes
+ * from the boot loader's ADT with the same handoff markers.
+ */
+bool dcp_is_v14_ext_node(const struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t6030-dcpext") ||
+	       of_device_is_compatible(np, "apple,t6031-dcpext");
+}
+
+/*
  * A T6030 external processor runs as a pipe of the main DRM device when the
  * display gate handed it its display DART: a piodma child on stream 4 of
  * that DART, and stream 0 among the display subsystem's iommus, so that
- * framebuffers are mapped for it as for the panel.
+ * framebuffers are mapped for it as for the panel. A T6031 one is a pipe of
+ * the external displays' own DRM device in the same way: stream 0 is among
+ * the iommus of the apple,t6031-dispext-subsystem the gate adds for it.
  */
 bool dcp_t6030_ext_native(const struct device_node *np)
 {
@@ -1390,7 +1403,7 @@ bool dcp_t6030_ext_native(const struct device_node *np)
 	u32 marker;
 	int i, n;
 
-	if (!of_device_is_compatible(np, "apple,t6030-dcpext"))
+	if (!dcp_is_v14_ext_node(np))
 		return false;
 	piodma = of_get_child_by_name(np, "piodma");
 	if (!piodma || !of_device_is_available(piodma) ||
@@ -1403,7 +1416,10 @@ bool dcp_t6030_ext_native(const struct device_node *np)
 	of_node_put(piodma);
 	if (dart.args_count != 1 || dart.args[0] != 4 || !of_device_is_available(dart.np))
 		goto out;
-	display = of_find_compatible_node(NULL, NULL, "apple,t6030-display-subsystem");
+	display = of_find_compatible_node(NULL, NULL,
+					  of_device_is_compatible(np, "apple,t6031-dcpext") ?
+					  "apple,t6031-dispext-subsystem" :
+					  "apple,t6030-display-subsystem");
 	n = display && of_device_is_available(display) ?
 		of_count_phandle_with_args(display, "iommus", "#iommu-cells") : 0;
 	for (i = 0; i < n && !native; i++) {
@@ -3450,13 +3466,15 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	 * T6030 and the internal panels with a board record (T6030, J613) run
 	 * the 14.7 firmware session handed over by the boot loader natively
 	 * (iomfb_v14_7.c); other 14.7.0 DCPs keep the template below.
-	 * The T6030 external processors: the 14.x firmware IOMFB only.
+	 * The T6030 external processors, and the T6031 one the display gate
+	 * describes: the 14.x firmware IOMFB only.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t6030-dcpext")) {
+	if (dcp_is_v14_ext_node(dev->of_node)) {
 		if (!strcmp(compat_str, "14.7.0"))
 			return DCP_FIRMWARE_V_14_7;
-		dev_err(dev, "T6030 display not started: DCP firmware-compat %s is not 14.7.0\n",
-			compat_str);
+		dev_err(dev, "%s display not started: DCP firmware-compat %s is not 14.7.0\n",
+			of_device_is_compatible(dev->of_node, "apple,t6031-dcpext") ?
+			"T6031 external" : "T6030", compat_str);
 		return DCP_FIRMWARE_UNKNOWN;
 	}
 
@@ -4266,7 +4284,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	dcp->fw_compat = fw_compat;
 	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext");
-	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
+	dcp->external = dcp_is_v14_ext_node(dev->of_node);
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
@@ -5121,6 +5139,8 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030, },
 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
+	/* The J516C HDMI port's dcpext0: the T6030 external role. */
+	{ .compatible = "apple,t6031-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
 	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
 	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031, },
 	{ .compatible = "apple,t8122-dcpext", .data = &apple_dcp_hw_t8122_dcpext, },

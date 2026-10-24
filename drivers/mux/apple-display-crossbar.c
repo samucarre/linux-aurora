@@ -1003,7 +1003,12 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	spin_lock_init(&dpxbar->lock);
 
 	dpxbar->dev = dev;
-	dpxbar->t6030_dpin = of_machine_is_compatible("apple,t6030");
+	/*
+	 * The J516C HDMI port's crossbar (T6031, ATC3), which the display
+	 * gate describes, is driven as T6030's.
+	 */
+	dpxbar->t6030_dpin = of_machine_is_compatible("apple,t6030") ||
+			     of_device_is_compatible(dev->of_node, "apple,t6031-display-crossbar");
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
