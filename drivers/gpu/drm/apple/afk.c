@@ -464,6 +464,41 @@ static void afk_service_worker(struct work_struct *work)
 
 static void afk_recv_handle_teardown(struct apple_dcp_afkep *ep, u32 channel);
 
+/*
+ * An announce whose properties name no service this driver could bind is
+ * left unbound, as before, and the processor goes on without it: the 14.7
+ * external role announces one such interface on its DPAV controller
+ * endpoint after the AV and DP controllers of both units. Say what the
+ * firmware sent instead of reporting an error. @err is what
+ * parse_epic_service_init() returned: -ENOENT for a dictionary walked
+ * whole without the EPICName/EPICProviderClass/EPICUnit triple (the H17P
+ * spelling counts on H17P firmware alone), another error for one this
+ * parser could not walk, which is worth a warning and what was read.
+ */
+static void afk_log_unbound_announce(struct apple_dcp_afkep *ep, u32 channel,
+				     const char *name, const u8 *props,
+				     size_t props_size, int err)
+{
+	struct dcp_parse_ctx ctx;
+	char desc[256] = "";
+	int ret;
+
+	ret = parse(props, props_size, &ctx);
+	if (!ret)
+		ret = parse_dict_describe(&ctx, desc, sizeof(desc));
+	/* Walked whole: only its description can still fail. */
+	if (err != -ENOENT)
+		ret = err;
+	if (!ret)
+		dev_info(ep->dcp->dev,
+			 "AFK[ep:%02x]: announce \"%s\" on channel %u carries no service identity, left unbound: {%s} (%zu bytes)\n",
+			 ep->endpoint, name, channel, desc, props_size);
+	else
+		dev_warn(ep->dcp->dev,
+			 "AFK[ep:%02x]: announce \"%s\" on channel %u has properties this driver cannot read: %d, left unbound: {%s} (%zu bytes)\n",
+			 ep->endpoint, name, channel, ret, desc, props_size);
+}
+
 static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 				 u8 *payload, size_t payload_size)
 {
@@ -534,9 +569,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
 					      ep->dcp->fw_compat == DCP_FIRMWARE_H17P);
 		if (ret) {
-			dev_err(ep->dcp->dev,
-				"AFK[ep:%02x]: failed to extract init props: %d\n",
-				ep->endpoint, ret);
+			afk_log_unbound_announce(ep, channel, name, props, props_size, ret);
 			return;
 		}
 		service_name = epic_class;
