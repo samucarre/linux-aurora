@@ -14,6 +14,7 @@
 #define T_ARRAY 2
 #define T_INT64 4
 #define T_STRING 9
+#define T_BLOB 10
 #define T_BOOL 11
 
 struct blob {
@@ -132,7 +133,9 @@ static void parser_service_init_truncated_test(struct kunit *test)
 	memcpy(b.data + b.len, "dcp", 3);
 	b.len += 3;
 
-	KUNIT_EXPECT_LT(test, parse_service(test, &b, false, &name, &class, &unit), 0);
+	/* Malformed is not "no identity": the walk's own error is kept. */
+	KUNIT_EXPECT_EQ(test, parse_service(test, &b, false, &name, &class, &unit),
+			-EINVAL);
 	KUNIT_EXPECT_TRUE(test, IS_ERR(name));
 	KUNIT_EXPECT_TRUE(test, IS_ERR(class));
 
@@ -142,7 +145,8 @@ static void parser_service_init_truncated_test(struct kunit *test)
 	blob_string(&b, "EPICName");
 	blob_string(&b, "dcp");
 
-	KUNIT_EXPECT_LT(test, parse_service(test, &b, false, &name, &class, &unit), 0);
+	KUNIT_EXPECT_EQ(test, parse_service(test, &b, false, &name, &class, &unit),
+			-EINVAL);
 	KUNIT_EXPECT_TRUE(test, IS_ERR(name));
 	KUNIT_EXPECT_TRUE(test, IS_ERR(class));
 }
@@ -171,6 +175,62 @@ static void parser_nesting_test(struct kunit *test)
 	KUNIT_EXPECT_LT(test, parse_service(test, &b, false, &name, &class, &unit), 0);
 	KUNIT_EXPECT_TRUE(test, IS_ERR(name));
 	KUNIT_EXPECT_TRUE(test, IS_ERR(class));
+}
+
+static void parser_dict_describe_test(struct kunit *test)
+{
+	struct dcp_parse_ctx ctx;
+	struct blob b;
+	char desc[96];
+
+	/* An announce without a service identity: all it carries is shown. */
+	blob_init(&b);
+	blob_tag(&b, T_DICT, 4);
+	blob_string(&b, "EPICName");
+	blob_string(&b, "dcpav-controller-epic");
+	blob_string(&b, "EPICUnit");
+	blob_int(&b, 1);
+	blob_string(&b, "Deferred");
+	blob_tag(&b, T_BOOL, 1);
+	blob_string(&b, "Nested");
+	blob_tag(&b, T_DICT, 1);
+	blob_string(&b, "Key");
+	blob_int(&b, 7);
+
+	KUNIT_ASSERT_EQ(test, parse(b.data, b.len, &ctx), 0);
+	KUNIT_EXPECT_EQ(test, parse_dict_describe(&ctx, desc, sizeof(desc)), 0);
+	KUNIT_EXPECT_STREQ(test, desc,
+			   "EPICName=dcpav-controller-epic, EPICUnit=1, Deferred=true, Nested={...}");
+	/* The dictionary was consumed whole, nested value included. */
+	KUNIT_EXPECT_EQ(test, ctx.pos, (u32)b.len);
+
+	/* A short buffer cuts the text, terminated, and consumes it all too. */
+	KUNIT_ASSERT_EQ(test, parse(b.data, b.len, &ctx), 0);
+	KUNIT_EXPECT_EQ(test, parse_dict_describe(&ctx, desc, 12), 0);
+	KUNIT_EXPECT_STREQ(test, desc, "EPICName=dc");
+	KUNIT_EXPECT_EQ(test, ctx.pos, (u32)b.len);
+
+	/* Firmware bytes that are not printable are escaped; a blob is sized. */
+	blob_init(&b);
+	blob_tag(&b, T_DICT, 2);
+	blob_string(&b, "Line\nBreak");
+	blob_tag(&b, T_BLOB, 3);
+	memcpy(b.data + b.len, "\1\2\3", 3);
+	b.len += 3;
+	blob_string(&b, "Flag");
+	blob_tag(&b, T_BOOL, 0);
+
+	KUNIT_ASSERT_EQ(test, parse(b.data, b.len, &ctx), 0);
+	KUNIT_EXPECT_EQ(test, parse_dict_describe(&ctx, desc, sizeof(desc)), 0);
+	KUNIT_EXPECT_STREQ(test, desc, "Line\\nBreak=<3 bytes>, Flag=false");
+	KUNIT_EXPECT_EQ(test, ctx.pos, (u32)b.len);
+
+	/* Only a dictionary is described. */
+	blob_init(&b);
+	blob_tag(&b, T_ARRAY, 1);
+	blob_int(&b, 1);
+	KUNIT_ASSERT_EQ(test, parse(b.data, b.len, &ctx), 0);
+	KUNIT_EXPECT_EQ(test, parse_dict_describe(&ctx, desc, sizeof(desc)), -EINVAL);
 }
 
 static void parser_bad_header_test(struct kunit *test)
@@ -273,6 +333,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_service_init_h17p_keys_test),
 	KUNIT_CASE(parser_service_init_truncated_test),
 	KUNIT_CASE(parser_nesting_test),
+	KUNIT_CASE(parser_dict_describe_test),
 	KUNIT_CASE(parser_bad_header_test),
 	KUNIT_CASE(parser_mode_count_test),
 	KUNIT_CASE(parser_mode_cap_test),

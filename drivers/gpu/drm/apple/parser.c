@@ -1504,7 +1504,8 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			break;
 	}
 
-	if (!parsed_unit || !parsed_name || !parsed_class)
+	/* Only a dictionary walked whole can lack the identity: an earlier error stands. */
+	if (!ret && (!parsed_unit || !parsed_name || !parsed_class))
 		ret = -ENOENT;
 
 	if (ret) {
@@ -1519,6 +1520,98 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 	}
 
 	return ret;
+}
+
+/* Append the value at @handle to a description, whatever its type. */
+static int describe_value(struct dcp_parse_ctx *handle, char *buf, size_t size,
+			  size_t *len)
+{
+	struct dcp_parse_ctx at = *handle;
+	const struct dcp_parse_tag *tag;
+	const void *data;
+	s64 value;
+
+	tag = parse_tag(handle);
+	if (IS_ERR(tag))
+		return PTR_ERR(tag);
+
+	switch (tag->type) {
+	case DCP_TYPE_STRING:
+		data = parse_bytes(handle, tag->size);
+		if (IS_ERR(data))
+			return PTR_ERR(data);
+		/* Firmware bytes: anything not printable is escaped. */
+		*len += scnprintf(buf + *len, size - *len, "%*pE",
+				  (int)tag->size, (const u8 *)data);
+		return 0;
+
+	case DCP_TYPE_INT64:
+		data = parse_bytes(handle, sizeof(s64));
+		if (IS_ERR(data))
+			return PTR_ERR(data);
+		memcpy(&value, data, sizeof(value));
+		*len += scnprintf(buf + *len, size - *len, "%lld", value);
+		return 0;
+
+	case DCP_TYPE_BOOL:
+		*len += scnprintf(buf + *len, size - *len, "%s",
+				  tag->size ? "true" : "false");
+		return 0;
+
+	case DCP_TYPE_BLOB:
+		data = parse_bytes(handle, tag->size);
+		if (IS_ERR(data))
+			return PTR_ERR(data);
+		*len += scnprintf(buf + *len, size - *len, "<%u bytes>",
+				  (unsigned int)tag->size);
+		return 0;
+
+	case DCP_TYPE_DICTIONARY:
+	case DCP_TYPE_ARRAY:
+		*len += scnprintf(buf + *len, size - *len, "%s",
+				  tag->type == DCP_TYPE_DICTIONARY ? "{...}" : "[...]");
+		*handle = at;
+		return skip(handle);
+
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * Describe the top level of the dictionary at @handle for one log line, as
+ * "key=value" pairs: strings (escaped), integers and booleans as they are, a
+ * blob by its size, a nested container as {...} or [...]. The text is cut to
+ * @size bytes, terminator included; the dictionary is consumed whole
+ * regardless. On an error the text holds what was read before it.
+ */
+int parse_dict_describe(struct dcp_parse_ctx *handle, char *buf, size_t size)
+{
+	struct iterator it;
+	size_t len = 0;
+	int ret;
+
+	if (!size)
+		return -EINVAL;
+	buf[0] = '\0';
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
+		if (it.idx)
+			len += scnprintf(buf + len, size - len, ", ");
+		ret = describe_value(handle, buf, size, &len);
+		if (ret)
+			return ret;
+		len += scnprintf(buf + len, size - len, "=");
+		ret = describe_value(handle, buf, size, &len);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)

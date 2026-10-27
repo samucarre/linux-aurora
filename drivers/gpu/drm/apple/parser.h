@@ -189,6 +189,7 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			     int *height_mm, bool *backlight_control);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			    const char **class, s64 *unit, bool h17p_keys);
+int parse_dict_describe(struct dcp_parse_ctx *handle, char *buf, size_t size);
 
 struct dcp_sound_format_mask {
 	u64 formats;			/* SNDRV_PCM_FMTBIT_* */
