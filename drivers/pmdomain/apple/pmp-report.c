@@ -12,6 +12,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -1272,6 +1273,11 @@ struct apple_pmp_report_entry {
 	u32 id;
 	/* The PMP does not acknowledge this request (a started PMP only). */
 	bool no_ack;
+	/*
+	 * Set after the start (apple,request-after-start): the startup
+	 * acknowledgment timeout, in ms, that sleep waits for it again; else 0.
+	 */
+	unsigned int after_ack_ms;
 	/* Withdrawn for system sleep (apple,release-for-sleep), and now so. */
 	bool sleep_release;
 	bool released;
@@ -1423,8 +1429,14 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_t6031_gfx);
  * provides its power domain only once the running PMP has acknowledged it.
  * The PMGR domains that name the entry as their parent, and every device in
  * them, are therefore probed and powered only after the PMP has taken the
- * block they make up. The request is never released: the entry's domain is
- * always on and has no power callbacks.
+ * block they make up. Its power domain never releases the request: the
+ * entry's domain is always on and has no power callbacks. Only system sleep
+ * withdraws it, if the entry is also apple,release-for-sleep: in the noirq
+ * phase, once the devices in the domains below it have suspended (those
+ * domains may stay on), and it is set again before those devices resume,
+ * waiting, sleeping, for the PMP to be ready and then to acknowledge it, each
+ * within the startup acknowledgment timeout (see
+ * apple_pmp_report_entry_resume_after()).
  *
  * apple_pmp_start_request_after() sets request @id and waits, sleeping, for
  * its acknowledgment, which it reads back with the request into @ack and
@@ -1506,6 +1518,8 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
  * suspended, its displays off and its links released or idle: withdraw such a
  * request if it is acknowledged, with one replacement write as macOS releases
  * its display requests, and assert it again before the processors resume.
+ * A request set after the start is set again as its probe set it (see
+ * apple_pmp_report_entry_resume_after()).
  */
 static int apple_pmp_report_entry_sleep(struct apple_pmp_report_entry *ent, bool release)
 {
@@ -1544,6 +1558,51 @@ static int apple_pmp_report_entry_suspend_noirq(struct device *dev)
 	return 0;
 }
 
+/*
+ * Sets a request set after the start (apple,request-after-start) again after
+ * system sleep, as the entry's probe set it. Here the request comes before
+ * the power it guards, so the devices in the PMGR domains below it, which
+ * resume only after this, must find it acknowledged: wait, sleeping (a noirq
+ * callback may sleep), for the PMP to report ready, set the request, and
+ * wait for its acknowledgment, each within the startup acknowledgment
+ * timeout, and log how long the PMP took. A PMP that is not ready gets the
+ * request all the same, as it had it before sleep. The request is written
+ * once, as the probe writes it: the other requests are written up to three
+ * times, each with an atomic wait of 50 ms for the acknowledgment, where
+ * this one is waited for, sleeping, up to the startup timeout.
+ */
+static int apple_pmp_report_entry_resume_after(struct device *dev,
+					       struct apple_pmp_report_entry *ent)
+{
+	struct apple_pmp_report *rep = dev->parent ? dev_get_drvdata(dev->parent) : NULL;
+	u64 bit = BIT_ULL(ent->id), status = 0, actual = 0;
+	ktime_t start = ktime_get();
+	int ret;
+
+	if (!rep)
+		return -ENODEV;
+	ret = readq_poll_timeout(rep->base + rep->offsets->status, status,
+				 status == PMP_REPORT_READY, USEC_PER_MSEC,
+				 ent->after_ack_ms * USEC_PER_MSEC);
+	apple_pmp_report_set_state(rep, ent->id, true, true);
+	if (ret) {
+		dev_err(dev, "%s: the PMP is not ready %u ms after sleep (status %#llx); its request is set again unacknowledged\n",
+			ent->genpd.name, ent->after_ack_ms, status);
+		return ret;
+	}
+	ret = readq_poll_timeout(rep->base + rep->offsets->actual, actual, actual & bit,
+				 USEC_PER_MSEC, ent->after_ack_ms * USEC_PER_MSEC);
+	if (ret) {
+		dev_err(dev, "%s not acknowledged within %u ms of its request after sleep: request %#llx ack %#llx\n",
+			ent->genpd.name, ent->after_ack_ms,
+			readq(rep->base + rep->offsets->tgt_read), actual);
+		return ret;
+	}
+	dev_info(dev, "%s acknowledged again %lld us after sleep\n", ent->genpd.name,
+		 ktime_us_delta(ktime_get(), start));
+	return 0;
+}
+
 static int apple_pmp_report_entry_resume_noirq(struct device *dev)
 {
 	struct apple_pmp_report_entry *ent = dev_get_drvdata(dev);
@@ -1552,6 +1611,8 @@ static int apple_pmp_report_entry_resume_noirq(struct device *dev)
 	if (!ent || !ent->released)
 		return 0;
 	ent->released = false;
+	if (ent->after_ack_ms)
+		return apple_pmp_report_entry_resume_after(dev, ent);
 	/*
 	 * Without the request the external display stays dark until reboot:
 	 * write it again, three times at most, while the PMP does not
@@ -1724,6 +1785,8 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 			goto err_free;
 		/* On from here, and the parent of IRQ-safe PMGR domains. */
 		ent->genpd.flags |= GENPD_FLAG_ALWAYS_ON | GENPD_FLAG_IRQ_SAFE;
+		/* Sleep sets it again as this did (apple_pmp_report_entry_resume_after()). */
+		ent->after_ack_ms = start->timing->ack;
 	} else {
 		if (of_property_read_bool(node, "apple,always-on")) {
 			ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;

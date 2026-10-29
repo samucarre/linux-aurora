@@ -47,11 +47,14 @@ def main():
         names.insert(names.index('static struct device_node *apple_pmp_report_t6030_entry('), 'static int apple_pmp_report_wait_t6030_bound(')
     # System sleep (apple,release-for-sleep), where the source has it.
     sleep = 'static int apple_pmp_report_entry_sleep(' in source
+    # A request set after the start, set again after sleep (T6031), where the source has it.
+    resume_after = sleep and 'static int apple_pmp_report_entry_resume_after(' in source
     if sleep:
         at = names.index('static int apple_pmp_report_entry_power_on(')
         names[at:at] = ['static int apple_pmp_report_entry_sleep(',
-                        'static int apple_pmp_report_entry_suspend_noirq(',
-                        'static int apple_pmp_report_entry_resume_noirq(']
+                        'static int apple_pmp_report_entry_suspend_noirq('] + \
+                       (['static int apple_pmp_report_entry_resume_after('] if resume_after else []) + \
+                       ['static int apple_pmp_report_entry_resume_noirq(']
     offsets = re.search(r'static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = \{.*?\n\};', source, re.S)[0]
     functions = '\n'.join(extract.function(source, n) for n in names)
     # The T8122 14.x wait (CONFIG_APPLE_T8122_GPU_PMP_LINK=0 here) precedes the dispatch; it is
@@ -61,7 +64,9 @@ def main():
     def with_t8122(text):
         return text.replace(dispatch, t8122 + dispatch, 1)
     validation = re.sub(r'^#include .*\n', '', (ROOT / 'drivers/pmdomain/apple/pmp-report-validation.h').read_text(), flags=re.M)
-    code = ('#define HAVE_SLEEP_RELEASE 1\n' if sleep else '') + offsets + '\n' + validation + '\n' + functions
+    code = ('#define HAVE_SLEEP_RELEASE 1\n' if sleep else '') + \
+           ('#define HAVE_RESUME_AFTER 1\n' if resume_after else '') + \
+           offsets + '\n' + validation + '\n' + functions
     # The actual overlay must still describe a halted supplier and disabled DMA/mailbox.
     assert overlay.count('status = \"disabled\";') >= 3
     (args.output / 'production.h').write_text(with_t8122(code))
@@ -100,6 +105,13 @@ def main():
                 ('sleep-not-reasserted', 'ret = apple_pmp_report_entry_sleep(ent, false);', 'ret = 0;'),
                 ('sleep-ignores-mark', '!ent->sleep_release ||', ''),
                 ('sleep-not-rewritten', '++tries < 3', '++tries < 1'),
+            ]
+        if resume_after:
+            controls += [
+                ('resume-after-not-taken', 'if (ent->after_ack_ms)', 'if (false)'),
+                ('resume-after-skips-ready', 'status == PMP_REPORT_READY, USEC_PER_MSEC', 'true, USEC_PER_MSEC'),
+                ('resume-after-skips-ack', 'actual & bit,', '((void)bit, true),'),
+                ('resume-after-not-set', 'apple_pmp_report_set_state(rep, ent->id, true, true);', '(void)0;'),
             ]
         for name, old, new in controls:
             assert code.count(old) == 1, (name, code.count(old))

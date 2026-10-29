@@ -27,6 +27,10 @@ typedef uint8_t u8;
 #define GENPD_FLAG_IRQ_SAFE 4
 #define MAX_PHANDLE_ARGS 4
 #define EPROBE_DEFER 517
+#define USEC_PER_MSEC 1000L
+typedef long long ktime_t;
+#define ktime_get() 0LL
+#define ktime_us_delta(a, b) ((a) - (b))
 #define SZ_4K 4096
 #define __iomem
 #define __force
@@ -144,6 +148,7 @@ struct apple_pmp_report_entry {
 	struct device_node *node, *report_node;
 	u32 id;
 	bool no_ack, removed;
+	unsigned int after_ack_ms;
 	bool sleep_release, released;
 };
 #define genpd_to_apple_pmp_report_entry(p) \
@@ -866,6 +871,38 @@ int main(void)
 	assert(apple_pmp_report_entry_resume_noirq(&entry_devs[1].dev) == -ETIMEDOUT &&
 	       ack_late == 2 && regs[0x1180 / 8] == target);
 	cases++;
+#ifdef HAVE_RESUME_AFTER
+	/*
+	 * A request set after the start (T6031 DISPEXT0) is set again after
+	 * sleep only once the PMP is ready, and waits for its acknowledgment.
+	 */
+	struct apple_pmp_report *sleeping = report_dev.dev.data;
+
+	/* The PMP acknowledges every write again (the late cases leave ack_late set). */
+	ack_late = 0;
+	ext->after_ack_ms = 2;
+	regs[0x11c0 / 8] = regs[0x1180 / 8];
+	assert(apple_pmp_report_entry_suspend_noirq(&entry_devs[1].dev) == 0 && ext->released &&
+	       regs[0x1180 / 8] == (target & ~BIT_ULL(8)));
+	assert(apple_pmp_report_entry_resume_noirq(&entry_devs[1].dev) == 0 && !ext->released &&
+	       regs[0x1180 / 8] == target && (regs[0x11c0 / 8] & BIT_ULL(8)));
+	cases++;
+	/* A PMP that is not ready still gets the request, but nothing waits for it. */
+	assert(apple_pmp_report_entry_suspend_noirq(&entry_devs[1].dev) == 0 && ext->released);
+	regs[sleeping->offsets->status / 8] = 0;
+	assert(apple_pmp_report_entry_resume_noirq(&entry_devs[1].dev) == -ETIMEDOUT &&
+	       !ext->released && regs[0x1180 / 8] == target);
+	cases++;
+	/* A ready PMP that does not acknowledge it times out, with the request set. */
+	regs[sleeping->offsets->status / 8] = PMP_REPORT_READY;
+	regs[0x11c0 / 8] = regs[0x1180 / 8];
+	ack_follows = true;
+	assert(apple_pmp_report_entry_suspend_noirq(&entry_devs[1].dev) == 0 && ext->released);
+	ack_follows = false;
+	assert(apple_pmp_report_entry_resume_noirq(&entry_devs[1].dev) == -ETIMEDOUT &&
+	       regs[0x1180 / 8] == target && !(regs[0x11c0 / 8] & BIT_ULL(8)));
+	cases++;
+#endif
 	cleanup();
 #endif
 	printf("PASS: %u actual overlay/probe/entry/DCP7/managed-start/supplier graph cases\n",
