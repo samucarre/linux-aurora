@@ -67,7 +67,9 @@
  * T6031 boot the gate also logs what the boot loader handed over, so that
  * a boot without the option already records what the next one needs. On a
  * J516C, apple_t6031_display.ext=1 as well also describes the HDMI port,
- * which the boot loader does not (see gate_t6031_ext_run()).
+ * which the boot loader does not (see gate_t6031_ext_run()). On every T6031,
+ * whatever the display switches, the gate also describes the PMU's RTC alarm
+ * from the ADT if the device tree does not (see gate_t6031_rtc_run()).
  */
 
 #define pr_fmt(fmt) fmt
@@ -3227,6 +3229,395 @@ out:
 	kfree(x);
 }
 
+/*
+ * T6031 RTC alarm
+ *
+ * The PMU that keeps the RTC counter, the primary Chapel (pmic@b on
+ * nub_spmi), also has a one-shot alarm that can wake the system. The SMC
+ * RTC driver uses it once the device tree describes it as t6031-die0.dtsi
+ * does: the PMU's alarm control, compare and mask registers as nvmem cells
+ * of pmic@b, the PMU's SPMI peripheral interrupt on nub_spmi, and
+ * wakeup-source. The device tree comes from the boot loader, and one built
+ * before that description leaves the RTC without its alarm.
+ *
+ * Unless apple_t6031_rtc.alarm=0, the gate describes the alarm itself then,
+ * from this Mac's ADT, in one changeset applied before devices are created.
+ * It does so only if the device tree has the RTC as before (its offset cell
+ * alone, no interrupt) and the ADT says what the driver expects:
+ *  - /arm-io/nub-spmi0 is nub_spmi, at the same address, and an interrupt
+ *    controller;
+ *  - its one primary PMU has pmic@b's USID and the RTC offset cell the
+ *    device tree names, and raises one interrupt on nub-spmi0;
+ *  - the alarm control byte also holds the alarm event and has the enable,
+ *    event and monitor bits the driver writes (0x40, 0x2 and 0x1), and the
+ *    alarm is masked by writing 1 to its mask;
+ *  - the control byte, the 32-bit compare value and the mask byte overlap
+ *    neither one another nor a cell the device tree has.
+ * nub_spmi then becomes an interrupt controller with two interrupt cells,
+ * as apple,spmi.yaml requires; pmic@b gets the three cells; and the RTC
+ * gets them after its offset cell, the interrupt, rising edge (the only
+ * type the controller takes), and wakeup-source. A device tree that
+ * describes the alarm already is left as it is. On a J516C the ADT gives
+ * the control byte at 0x2000, the compare value at 0x2008, the mask at
+ * 0x200e and peripheral interrupt 2.
+ */
+
+/* apple_t6031_rtc.alarm=0: leave the RTC alarm undescribed. */
+static bool gate_t6031_rtc_alarm __initdata = true;
+
+static int __init gate_setup_t6031_rtc_alarm(char *arg)
+{
+	return arg ? kstrtobool(arg, &gate_t6031_rtc_alarm) : -EINVAL;
+}
+early_param("apple_t6031_rtc.alarm", gate_setup_t6031_rtc_alarm);
+
+/* What rtc-macsmc writes to the PMU's alarm registers. */
+#define GATE_RTC_CTRL_ALARM_EN		0x40
+#define GATE_RTC_CTRL_ALARM_EVENT	0x2
+#define GATE_RTC_CTRL_MONITOR		0x1
+#define GATE_RTC_ALARM_MASKED		1
+/* The SPMI controller's peripheral interrupts, the one type it takes, its registers. */
+#define GATE_SPMI_PERIPHERAL_IRQS	256
+#define GATE_IRQ_EDGE_RISING		1
+#define GATE_SPMI_REGS			0x10000
+
+/* The alarm's control, compare and mask registers, as the RTC names their cells. */
+enum { GATE_RTC_CTRL, GATE_RTC_ALARM, GATE_RTC_MASK, GATE_RTC_NR };
+
+static const char *const gate_rtc_node[GATE_RTC_NR] __initconst = {
+	"rtc-ctrl", "rtc-alarm", "rtc-alarm-mask",
+};
+static const u32 gate_rtc_bytes[GATE_RTC_NR] __initconst = { 1, 4, 1 };
+
+#define gate_rtc_info(fmt, ...) pr_info("apple-t6031-rtc: " fmt, ##__VA_ARGS__)
+#define gate_rtc_warn(fmt, ...) pr_warn("apple-t6031-rtc: " fmt, ##__VA_ARGS__)
+
+/* What the RTC alarm phase found and checked, and its changeset. */
+struct gate_rtc {
+	struct device_node *rtc, *offset, *layout, *pmic, *spmi;
+	u64 spmi_addr;
+	u32 usid;
+	u32 offset_reg[2];
+	/* nub_spmi is an interrupt controller already. */
+	bool spmi_irqc;
+	/* From the ADT: the alarm registers, as GATE_RTC_*, and its interrupt. */
+	u32 reg[GATE_RTC_NR];
+	u32 irq;
+
+	struct of_changeset *cs;
+	/* The cells the changeset adds, and the phandles it gives them and nub_spmi. */
+	struct device_node *cell[GATE_RTC_NR];
+	phandle cell_phandle[GATE_RTC_NR];
+	phandle spmi_phandle;
+};
+
+static int __init gate_rtc_refuse(const char *why)
+{
+	gate_rtc_warn("RTC alarm not described: %s\n", why);
+	return -EINVAL;
+}
+
+/* Whether @bytes bytes at @addr overlap a cell of @layout. */
+static bool __init gate_rtc_overlaps(struct device_node *layout, u32 addr, u32 bytes)
+{
+	struct device_node *cell;
+	u32 reg[2];
+
+	for_each_child_of_node(layout, cell) {
+		if (of_property_read_u32_array(cell, "reg", reg, 2))
+			continue;
+		if (addr < (u64)reg[0] + reg[1] && reg[0] < (u64)addr + bytes) {
+			of_node_put(cell);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The SMC RTC and the PMU cell it reads, as a device tree without the alarm
+ * has them. Returns -EALREADY if the device tree describes the alarm.
+ */
+static int __init gate_rtc_resolve(struct gate_rtc *r)
+{
+	struct device_node *np;
+	struct resource res;
+	const char *name;
+	unsigned int i;
+	u32 cells;
+
+	r->rtc = gate_find_one("apple,smc-rtc");
+	if (!r->rtc || !of_device_is_available(r->rtc))
+		return gate_rtc_refuse("the device tree has no SMC RTC");
+	if (of_property_match_string(r->rtc, "nvmem-cell-names", "rtc_ctrl") >= 0) {
+		gate_rtc_info("the device tree describes the RTC alarm\n");
+		return -EALREADY;
+	}
+	if (of_property_count_strings(r->rtc, "nvmem-cell-names") != 1 ||
+	    of_property_read_string(r->rtc, "nvmem-cell-names", &name) ||
+	    strcmp(name, "rtc_offset") ||
+	    of_property_count_u32_elems(r->rtc, "nvmem-cells") != 1 ||
+	    of_property_present(r->rtc, "interrupts") ||
+	    of_property_present(r->rtc, "interrupts-extended") ||
+	    of_property_present(r->rtc, "interrupt-parent") ||
+	    of_property_present(r->rtc, "wakeup-source"))
+		return gate_rtc_refuse("the SMC RTC has more than its offset cell");
+
+	/* The offset cell, in a fixed layout of a PMU on a T6031 SPMI controller. */
+	r->offset = of_parse_phandle(r->rtc, "nvmem-cells", 0);
+	r->layout = r->offset ? of_get_parent(r->offset) : NULL;
+	r->pmic = r->layout ? of_get_parent(r->layout) : NULL;
+	r->spmi = r->pmic ? of_get_parent(r->pmic) : NULL;
+	if (!r->spmi || !r->offset->phandle ||
+	    of_property_count_u32_elems(r->offset, "reg") != 2 ||
+	    of_property_read_u32_array(r->offset, "reg", r->offset_reg, 2) ||
+	    !of_node_name_eq(r->layout, "nvmem-layout") ||
+	    !of_device_is_compatible(r->layout, "fixed-layout") ||
+	    of_property_read_u32(r->layout, "#address-cells", &cells) || cells != 1 ||
+	    of_property_read_u32(r->layout, "#size-cells", &cells) || cells != 1 ||
+	    !of_device_is_compatible(r->pmic, "apple,spmi-nvmem") ||
+	    !of_device_is_available(r->pmic) ||
+	    of_property_read_u32_index(r->pmic, "reg", 0, &r->usid) ||
+	    !of_device_is_compatible(r->spmi, "apple,t6031-spmi") ||
+	    !of_device_is_available(r->spmi) ||
+	    /* The controller has peripheral interrupts only with its own. */
+	    !of_property_present(r->spmi, "interrupts") ||
+	    of_address_to_resource(r->spmi, 0, &res))
+		return gate_rtc_refuse("the RTC offset cell is not in a fixed layout of a PMU on a T6031 SPMI controller with an interrupt");
+	r->spmi_addr = res.start;
+
+	r->spmi_irqc = of_property_read_bool(r->spmi, "interrupt-controller");
+	if (r->spmi_irqc ? of_property_read_u32(r->spmi, "#interrupt-cells", &cells) || cells != 2 :
+			   of_property_present(r->spmi, "#interrupt-cells"))
+		return gate_rtc_refuse("the SPMI controller has other interrupt cells");
+
+	for (i = 0; i < GATE_RTC_NR; i++) {
+		np = of_get_child_by_name(r->layout, gate_rtc_node[i]);
+		of_node_put(np);
+		if (np)
+			return gate_rtc_refuse("the PMU has an alarm cell already");
+	}
+	return 0;
+}
+
+/* The ADT's one primary PMU below @spmi with USID @usid, or 0. */
+static size_t __init gate_rtc_adt_pmu(const struct gate_adt *adt, size_t spmi, u32 usid)
+{
+	u32 props = get_unaligned_le32(adt->data + spmi);
+	u32 children = get_unaligned_le32(adt->data + spmi + 4);
+	size_t off = spmi + 8, found = 0;
+	u32 i;
+
+	for (i = 0; i < props; i++)
+		off += 36 + ALIGN(get_unaligned_le32(adt->data + off + 32) & 0x7fffffff, 4);
+	for (i = 0; i < children; i++) {
+		if (gate_adt_u32(adt, off, "is-primary", 0) == 1 &&
+		    gate_adt_u32(adt, off, "reg", 0) == usid) {
+			if (found)
+				return 0;
+			found = off;
+		}
+		off = gate_adt_node_end(adt, off, 1);
+		if (!off)
+			return 0;
+	}
+	return found;
+}
+
+/* The alarm, as the ADT gives it, checked against the driver and the device tree. */
+static int __init gate_rtc_adt(const struct gate_adt *adt, struct gate_rtc *r)
+{
+	size_t armio, spmi, pmu = 0;
+	const u8 *irq = NULL, *parent = NULL;
+	u32 len = 0, plen = 0, ph;
+	u64 addr, size;
+	unsigned int i, j;
+
+	armio = gate_adt_child(adt, 0, "arm-io");
+	if (!armio || gate_adt_u32(adt, armio, "#address-cells", 0) != 2 ||
+	    gate_adt_u32(adt, armio, "#size-cells", 0) != 2)
+		return gate_rtc_refuse("the ADT has no two-cell /arm-io");
+	spmi = gate_adt_child(adt, armio, "nub-spmi0");
+	ph = spmi ? gate_adt_u32(adt, spmi, "AAPL,phandle", 0) : U32_MAX;
+	if (!spmi || gate_adt_reg(adt, armio, spmi, 0, &addr, &size) || addr != r->spmi_addr ||
+	    !gate_adt_prop(adt, spmi, "interrupt-controller", &len) || ph == U32_MAX)
+		return gate_rtc_refuse("the ADT's nub-spmi0 is not this SPMI controller as an interrupt controller");
+
+	pmu = gate_rtc_adt_pmu(adt, spmi, r->usid);
+	if (pmu) {
+		irq = gate_adt_prop(adt, pmu, "interrupts", &len);
+		parent = gate_adt_prop(adt, pmu, "interrupt-parent", &plen);
+	}
+	if (!irq || len != 4 || !parent || plen != 4 || get_unaligned_le32(parent) != ph)
+		return gate_rtc_refuse("the ADT has no primary PMU at this USID with one interrupt on nub-spmi0");
+	r->irq = get_unaligned_le32(irq);
+	if (r->irq >= GATE_SPMI_PERIPHERAL_IRQS)
+		return gate_rtc_refuse("the PMU's interrupt is not a peripheral interrupt");
+
+	r->reg[GATE_RTC_CTRL] = gate_adt_u32(adt, pmu, "info-rtc_alarm_ctrl", 0);
+	r->reg[GATE_RTC_ALARM] = gate_adt_u32(adt, pmu, "info-rtc_alarm_offset", 0);
+	r->reg[GATE_RTC_MASK] = gate_adt_u32(adt, pmu, "info-rtc_irq_mask_offset", 0);
+	if (gate_adt_u32(adt, pmu, "info-rtc_alarm_event", 0) != r->reg[GATE_RTC_CTRL] ||
+	    gate_adt_u32(adt, pmu, "info-rtc_alarm_ctrl_en_mask", 0) != GATE_RTC_CTRL_ALARM_EN ||
+	    gate_adt_u32(adt, pmu, "info-rtc_alarm_event_mask", 0) != GATE_RTC_CTRL_ALARM_EVENT ||
+	    gate_adt_u32(adt, pmu, "info-rtc_alarm_monitor_mask", 0) != GATE_RTC_CTRL_MONITOR ||
+	    gate_adt_u32(adt, pmu, "info-rtc_alarm_mask", 0) != GATE_RTC_ALARM_MASKED)
+		return gate_rtc_refuse("the PMU's alarm is not the one the RTC driver programs");
+	if (gate_adt_u32(adt, pmu, "info-clock_offset", 0) != r->offset_reg[0] ||
+	    gate_adt_u32(adt, pmu, "info-clock_offset", 1) != r->offset_reg[1])
+		return gate_rtc_refuse("the PMU's RTC offset is not the cell the device tree names");
+	for (i = 0; i < GATE_RTC_NR; i++) {
+		if ((u64)r->reg[i] + gate_rtc_bytes[i] > GATE_SPMI_REGS ||
+		    gate_rtc_overlaps(r->layout, r->reg[i], gate_rtc_bytes[i]))
+			return gate_rtc_refuse("an alarm register is out of range or in a cell already");
+		for (j = 0; j < i; j++)
+			if (r->reg[i] < (u64)r->reg[j] + gate_rtc_bytes[j] &&
+			    r->reg[j] < (u64)r->reg[i] + gate_rtc_bytes[i])
+				return gate_rtc_refuse("the alarm registers overlap");
+	}
+	return 0;
+}
+
+/* Sets @name of @np to @len bytes of @value, adding it if it is missing. */
+static int __init gate_rtc_set(struct of_changeset *cs, struct device_node *np,
+			       const char *name, const void *value, size_t len)
+{
+	/* Kept for good once applied: the live tree refers to it. */
+	struct property *prop = kzalloc_obj(*prop);
+	int ret = -ENOMEM;
+
+	if (prop) {
+		prop->name = kstrdup(name, GFP_KERNEL);
+		prop->value = kmemdup(value, len, GFP_KERNEL);
+		prop->length = len;
+		if (prop->name && prop->value)
+			ret = of_changeset_update_property(cs, np, prop);
+		if (ret) {
+			kfree(prop->name);
+			kfree(prop->value);
+			kfree(prop);
+		}
+	}
+	return ret;
+}
+
+/* The alarm's cells, interrupt and wakeup-source, in the changeset. */
+static int __init gate_rtc_build(struct gate_rtc *r)
+{
+	static const char names[] = "rtc_offset\0rtc_ctrl\0rtc_alarm\0rtc_alarm_mask";
+	phandle next = gate_free_phandle();
+	__be32 cells[1 + GATE_RTC_NR];
+	u32 reg[2], irq[3];
+	char name[32];
+	unsigned int i;
+	int ret = 0;
+
+	r->spmi_phandle = r->spmi->phandle;
+	if (!r->spmi_phandle) {
+		r->spmi_phandle = next++;
+		ret = of_changeset_add_prop_u32(r->cs, r->spmi, "phandle", r->spmi_phandle);
+	}
+	if (!ret && !r->spmi_irqc)
+		ret = of_changeset_add_prop_bool(r->cs, r->spmi, "interrupt-controller") ?:
+		      of_changeset_add_prop_u32(r->cs, r->spmi, "#interrupt-cells", 2);
+
+	cells[0] = cpu_to_be32(r->offset->phandle);
+	for (i = 0; i < GATE_RTC_NR && !ret; i++) {
+		snprintf(name, sizeof(name), "%s@%x", gate_rtc_node[i], r->reg[i]);
+		r->cell[i] = of_changeset_create_node(r->cs, r->layout, name);
+		if (!r->cell[i])
+			return -ENOMEM;
+		r->cell_phandle[i] = next++;
+		cells[1 + i] = cpu_to_be32(r->cell_phandle[i]);
+		reg[0] = r->reg[i];
+		reg[1] = gate_rtc_bytes[i];
+		ret = of_changeset_add_prop_u32_array(r->cs, r->cell[i], "reg", reg, 2) ?:
+		      of_changeset_add_prop_u32(r->cs, r->cell[i], "phandle", r->cell_phandle[i]);
+	}
+	if (ret)
+		return ret;
+
+	irq[0] = r->spmi_phandle;
+	irq[1] = r->irq;
+	irq[2] = GATE_IRQ_EDGE_RISING;
+	return gate_rtc_set(r->cs, r->rtc, "nvmem-cells", cells, sizeof(cells)) ?:
+	       gate_rtc_set(r->cs, r->rtc, "nvmem-cell-names", names, sizeof(names)) ?:
+	       of_changeset_add_prop_u32_array(r->cs, r->rtc, "interrupts-extended", irq, 3) ?:
+	       of_changeset_add_prop_bool(r->cs, r->rtc, "wakeup-source");
+}
+
+/* Checks the alarm against the ADT and describes it; nothing changes on failure. */
+static int __init gate_rtc_apply(const struct gate_adt *adt, struct gate_rtc *r)
+{
+	unsigned int i;
+	int ret;
+
+	ret = gate_rtc_adt(adt, r);
+	if (ret)
+		return ret;
+	r->cs = gate_cs_alloc();
+	if (!r->cs)
+		return -ENOMEM;
+	ret = gate_rtc_build(r);
+	if (!ret)
+		ret = of_changeset_apply(r->cs);
+	if (ret) {
+		/* Nothing applied: the changeset's nodes and properties are dropped. */
+		gate_cs_free(r->cs);
+		r->cs = NULL;
+		gate_rtc_warn("RTC alarm not described: changeset failed: %d\n", ret);
+		return ret;
+	}
+	/* Attaching a node, or adding a "phandle", does not set the node's phandle. */
+	r->spmi->phandle = r->spmi_phandle;
+	for (i = 0; i < GATE_RTC_NR; i++)
+		r->cell[i]->phandle = r->cell_phandle[i];
+
+	gate_rtc_info("RTC alarm described from the ADT: %pOFP, %pOFP and %pOFP in %pOF, interrupt %u of %pOF (rising edge), wakeup source\n",
+		      r->cell[GATE_RTC_CTRL], r->cell[GATE_RTC_ALARM], r->cell[GATE_RTC_MASK],
+		      r->layout, r->irq, r->spmi);
+	return 0;
+}
+
+static void __init gate_rtc_put(struct gate_rtc *r)
+{
+	unsigned int i;
+
+	for (i = 0; i < GATE_RTC_NR; i++)
+		of_node_put(r->cell[i]);
+	of_node_put(r->spmi);
+	of_node_put(r->pmic);
+	of_node_put(r->layout);
+	of_node_put(r->offset);
+	of_node_put(r->rtc);
+}
+
+static void __init gate_t6031_rtc_run(void)
+{
+	struct gate_adt adt = {};
+	struct gate_rtc r = {};
+	int ret;
+
+	/* Nothing would use it. */
+	if (!IS_ENABLED(CONFIG_RTC_DRV_MACSMC))
+		return;
+	if (!gate_t6031_rtc_alarm) {
+		gate_rtc_info("RTC alarm not described: apple_t6031_rtc.alarm=0\n");
+		return;
+	}
+	ret = gate_rtc_resolve(&r);
+	if (!ret) {
+		ret = gate_adt_load(&adt);
+		if (ret)
+			gate_rtc_warn("RTC alarm not described: no readable boot loader ADT (%d)\n",
+				      ret);
+	}
+	if (!ret)
+		gate_rtc_apply(&adt, &r);
+	gate_rtc_put(&r);
+	kvfree(adt.data);
+}
+
 static void __init gate_run(void)
 {
 	struct device_node *np[GATE_NR_NODES] = {};
@@ -3303,6 +3694,9 @@ static int __init apple_t6030_display_gate(void)
 	}
 
 	gate_run();
+	/* Not a display matter, but the same boot loader handoff and ADT. */
+	if (gate_soc == &gate_t6031)
+		gate_t6031_rtc_run();
 	return 0;
 }
 arch_initcall(apple_t6030_display_gate);
