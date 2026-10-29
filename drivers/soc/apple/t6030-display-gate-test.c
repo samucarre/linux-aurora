@@ -23,6 +23,7 @@
  */
 
 #include <kunit/test.h>
+#include <linux/of_irq.h>
 
 extern const u8 __dtbo_t6031_gate_test_begin[];
 extern const u8 __dtbo_t6031_gate_test_end[];
@@ -987,5 +988,390 @@ static struct kunit_suite gate_t8122_suite __refdata = {
 	.test_cases = gate_t8122_cases,
 };
 
+/*
+ * T6031 RTC alarm (t6031-rtc-test.dtso): the phase describes the alarm from
+ * an ADT that agrees with the driver and the device tree, as on a J516C, and
+ * changes nothing when one of them does not.
+ */
+
+extern const u8 __dtbo_t6031_rtc_test_begin[];
+extern const u8 __dtbo_t6031_rtc_test_end[];
+
+#define GT_RTC_SPMI	"/t6031-rtc-test/spmi@2a1014000"
+#define GT_RTC_LAYOUT	GT_RTC_SPMI "/pmic@b/nvmem-layout"
+#define GT_RTC_NODE	"/t6031-rtc-test/smc@2a4400000/rtc"
+
+static int gt_fixture_rtc __initdata = -1;
+
+/* What the test ADT's primary PMU says. */
+struct gt_rtc_pmu {
+	u32 usid, irq, parent;
+	u32 ctrl, event, en, event_mask, monitor, alarm, mask, masked;
+	u32 offset[2];
+};
+
+/* The J516C's (ADT of 2026-10-23), which the test tree matches. */
+static const struct gt_rtc_pmu gt_rtc_j516c __initconst = {
+	.usid = 0xb, .irq = 2, .parent = 255,
+	.ctrl = 0x2000, .event = 0x2000, .en = 0x40, .event_mask = 0x2, .monitor = 0x1,
+	.alarm = 0x2008, .mask = 0x200e, .masked = 1,
+	.offset = { 0x2100, 6 },
+};
+
+/* An ADT under construction: a node's properties precede its children. */
+struct gt_adt {
+	u8 *data;
+	size_t len, node;
+	u32 props;
+};
+
+static void __init gt_adt_close(struct gt_adt *w)
+{
+	if (w->len)
+		put_unaligned_le32(w->props, w->data + w->node);
+}
+
+static void __init gt_adt_node(struct gt_adt *w, u32 children)
+{
+	gt_adt_close(w);
+	w->node = w->len;
+	w->props = 0;
+	put_unaligned_le32(children, w->data + w->len + 4);
+	w->len += 8;
+}
+
+static void __init gt_adt_prop(struct gt_adt *w, const char *name, const void *value, u32 len)
+{
+	strscpy((char *)w->data + w->len, name, 32);
+	put_unaligned_le32(len, w->data + w->len + 32);
+	if (len)
+		memcpy(w->data + w->len + 36, value, len);
+	w->len += 36 + ALIGN(len, 4);
+	w->props++;
+}
+
+static void __init gt_adt_cells(struct gt_adt *w, const char *name, const u32 *v, unsigned int n)
+{
+	__le32 le[6];
+	unsigned int i;
+
+	for (i = 0; i < n && i < ARRAY_SIZE(le); i++)
+		le[i] = cpu_to_le32(v[i]);
+	gt_adt_prop(w, name, le, i * sizeof(*le));
+}
+
+#define gt_adt_u32(w, name, ...) \
+	gt_adt_cells(w, name, (const u32[]){ __VA_ARGS__ }, \
+		     sizeof((const u32[]){ __VA_ARGS__ }) / sizeof(u32))
+
+static void __init gt_adt_str(struct gt_adt *w, const char *name, const char *str)
+{
+	gt_adt_prop(w, name, str, strlen(str) + 1);
+}
+
+/*
+ * /arm-io/nub-spmi0 at 0x2a1014000, with a second child at the PMU's USID
+ * that is not the primary PMU, and the primary PMU as @pmu describes it.
+ */
+static void __init gt_rtc_adt(struct kunit *test, struct gate_adt *adt,
+			      const struct gt_rtc_pmu *pmu)
+{
+	struct gt_adt w = { .data = kunit_kzalloc(test, SZ_4K, GFP_KERNEL) };
+
+	KUNIT_ASSERT_NOT_NULL(test, w.data);
+	gt_adt_node(&w, 1);
+	gt_adt_str(&w, "name", "device-tree");
+	gt_adt_node(&w, 1);
+	gt_adt_str(&w, "name", "arm-io");
+	gt_adt_u32(&w, "#address-cells", 2);
+	gt_adt_u32(&w, "#size-cells", 2);
+	/* {child, parent, size} as 64-bit numbers. */
+	gt_adt_u32(&w, "ranges", 0, 0, 0, 2, 0, 1);
+	gt_adt_node(&w, 2);
+	gt_adt_str(&w, "name", "nub-spmi0");
+	gt_adt_u32(&w, "reg", 0xa1014000, 0, 0x4000, 0);
+	gt_adt_u32(&w, "AAPL,phandle", 255);
+	gt_adt_prop(&w, "interrupt-controller", NULL, 0);
+	gt_adt_node(&w, 0);
+	gt_adt_str(&w, "name", "btm");
+	gt_adt_u32(&w, "reg", pmu->usid, 0);
+	gt_adt_node(&w, 0);
+	gt_adt_str(&w, "name", "spmi-chapelL1-b");
+	gt_adt_u32(&w, "is-primary", 1);
+	gt_adt_u32(&w, "reg", pmu->usid, 3, 0, 4, 0, 0);
+	gt_adt_u32(&w, "interrupts", pmu->irq);
+	gt_adt_u32(&w, "interrupt-parent", pmu->parent);
+	gt_adt_u32(&w, "info-rtc_alarm_ctrl", pmu->ctrl);
+	gt_adt_u32(&w, "info-rtc_alarm_event", pmu->event);
+	gt_adt_u32(&w, "info-rtc_alarm_ctrl_en_mask", pmu->en);
+	gt_adt_u32(&w, "info-rtc_alarm_event_mask", pmu->event_mask);
+	gt_adt_u32(&w, "info-rtc_alarm_monitor_mask", pmu->monitor);
+	gt_adt_u32(&w, "info-rtc_alarm_offset", pmu->alarm);
+	gt_adt_u32(&w, "info-rtc_irq_mask_offset", pmu->mask);
+	gt_adt_u32(&w, "info-rtc_alarm_mask", pmu->masked);
+	gt_adt_u32(&w, "info-clock_offset", pmu->offset[0], pmu->offset[1]);
+	gt_adt_close(&w);
+	KUNIT_ASSERT_LE(test, w.len, (size_t)SZ_4K);
+	adt->data = w.data;
+	adt->size = w.len;
+	KUNIT_ASSERT_NE(test, gate_adt_node_end(adt, 0, 0), 0);
+}
+
+static int __init gt_suite_init_rtc(struct kunit_suite *suite)
+{
+	return of_overlay_fdt_apply(__dtbo_t6031_rtc_test_begin,
+				    __dtbo_t6031_rtc_test_end - __dtbo_t6031_rtc_test_begin,
+				    &gt_fixture_rtc, NULL);
+}
+
+static int __init gt_init_rtc(struct kunit *test)
+{
+	struct gate_test *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+
+	if (!t)
+		return -ENOMEM;
+	test->priv = t;
+	of_changeset_init(&t->cs);
+	return 0;
+}
+
+static void __init gt_exit_rtc(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+
+	of_changeset_revert(&t->cs);
+	of_changeset_destroy(&t->cs);
+}
+
+/* The test tree as before the alarm: nothing of it described. */
+static void __init gt_rtc_untouched(struct kunit *test)
+{
+	struct device_node *rtc = gt_node(test, GT_RTC_NODE);
+	struct device_node *layout = gt_node(test, GT_RTC_LAYOUT);
+	struct device_node *cell;
+
+	KUNIT_EXPECT_FALSE(test, of_property_read_bool(gt_node(test, GT_RTC_SPMI),
+						       "interrupt-controller"));
+	KUNIT_EXPECT_EQ(test, of_property_count_u32_elems(rtc, "nvmem-cells"), 1);
+	KUNIT_EXPECT_EQ(test, of_property_count_strings(rtc, "nvmem-cell-names"), 1);
+	KUNIT_EXPECT_FALSE(test, of_property_present(rtc, "interrupts-extended"));
+	KUNIT_EXPECT_FALSE(test, of_property_read_bool(rtc, "wakeup-source"));
+	cell = of_get_child_by_name(layout, "rtc-ctrl");
+	KUNIT_EXPECT_NULL(test, cell);
+	of_node_put(cell);
+}
+
+/* Undoes a phase that applied: its changeset, and the phandle it gave nub_spmi. */
+static void __init gt_rtc_undo(struct kunit *test, struct gate_rtc *r, phandle spmi)
+{
+	KUNIT_EXPECT_EQ(test, of_changeset_revert(r->cs), 0);
+	r->spmi->phandle = spmi;
+	gate_cs_free(r->cs);
+	r->cs = NULL;
+}
+
+/* A cell of the RTC, by index, at @addr with @bytes bytes. */
+static void __init gt_rtc_cell(struct kunit *test, struct device_node *rtc, int idx,
+			       const char *name, u32 addr, u32 bytes)
+{
+	struct device_node *cell = of_parse_phandle(rtc, "nvmem-cells", idx);
+	const char *id = NULL;
+	u32 reg[2] = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, cell);
+	KUNIT_EXPECT_PTR_EQ(test, cell->parent, gt_node(test, GT_RTC_LAYOUT));
+	KUNIT_EXPECT_EQ(test, of_property_read_u32_array(cell, "reg", reg, 2), 0);
+	KUNIT_EXPECT_EQ(test, reg[0], addr);
+	KUNIT_EXPECT_EQ(test, reg[1], bytes);
+	KUNIT_EXPECT_EQ(test, of_property_read_string_index(rtc, "nvmem-cell-names", idx, &id), 0);
+	KUNIT_EXPECT_STREQ(test, id, name);
+	of_node_put(cell);
+}
+
+/* As on a J516C: the alarm is described as t6031-die0.dtsi has it. */
+static void __init gate_t6031_rtc_described(struct kunit *test)
+{
+	struct device_node *spmi = gt_node(test, GT_RTC_SPMI);
+	struct device_node *rtc = gt_node(test, GT_RTC_NODE);
+	phandle before = spmi->phandle;
+	struct of_phandle_args irq;
+	struct gate_rtc r = {}, again = {};
+	struct device_node *np;
+	struct gate_adt adt;
+	u32 cells = 0;
+
+	gt_rtc_untouched(test);
+	gt_rtc_adt(test, &adt, &gt_rtc_j516c);
+	KUNIT_ASSERT_EQ(test, gate_rtc_resolve(&r), 0);
+	KUNIT_EXPECT_EQ(test, r.usid, 0xb);
+	KUNIT_EXPECT_EQ(test, r.spmi_addr, 0x2a1014000ULL);
+	KUNIT_ASSERT_EQ(test, gate_rtc_apply(&adt, &r), 0);
+
+	/* nub_spmi: an interrupt controller with two cells, and a phandle. */
+	KUNIT_EXPECT_TRUE(test, of_property_read_bool(spmi, "interrupt-controller"));
+	KUNIT_EXPECT_EQ(test, of_property_read_u32(spmi, "#interrupt-cells", &cells), 0);
+	KUNIT_EXPECT_EQ(test, cells, 2);
+	KUNIT_EXPECT_NE(test, spmi->phandle, 0);
+	np = of_find_node_by_phandle(spmi->phandle);
+	KUNIT_EXPECT_PTR_EQ(test, np, spmi);
+	of_node_put(np);
+
+	/* The RTC: the four cells, in the binding's order. */
+	KUNIT_EXPECT_EQ(test, of_property_count_u32_elems(rtc, "nvmem-cells"), 4);
+	gt_rtc_cell(test, rtc, 0, "rtc_offset", 0x2100, 6);
+	gt_rtc_cell(test, rtc, 1, "rtc_ctrl", 0x2000, 1);
+	gt_rtc_cell(test, rtc, 2, "rtc_alarm", 0x2008, 4);
+	gt_rtc_cell(test, rtc, 3, "rtc_alarm_mask", 0x200e, 1);
+	KUNIT_EXPECT_STREQ(test, of_node_full_name(r.cell[GATE_RTC_MASK]), "rtc-alarm-mask@200e");
+
+	/* Its interrupt parses to peripheral interrupt 2 of nub_spmi, rising edge. */
+	KUNIT_ASSERT_EQ(test, of_irq_parse_one(rtc, 0, &irq), 0);
+	KUNIT_EXPECT_PTR_EQ(test, irq.np, spmi);
+	KUNIT_EXPECT_EQ(test, irq.args_count, 2);
+	KUNIT_EXPECT_EQ(test, irq.args[0], 2);
+	KUNIT_EXPECT_EQ(test, irq.args[1], GATE_IRQ_EDGE_RISING);
+	of_node_put(irq.np);
+	KUNIT_EXPECT_TRUE(test, of_property_read_bool(rtc, "wakeup-source"));
+
+	/* Described now: a second pass leaves it alone. */
+	KUNIT_EXPECT_EQ(test, gate_rtc_resolve(&again), -EALREADY);
+	gate_rtc_put(&again);
+
+	gt_rtc_undo(test, &r, before);
+	gate_rtc_put(&r);
+	gt_rtc_untouched(test);
+}
+
+/* An ADT that does not say what the driver expects changes nothing. */
+static void __init gate_t6031_rtc_adt_refused(struct kunit *test)
+{
+	struct gt_rtc_pmu bad[11];
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(bad); i++)
+		bad[i] = gt_rtc_j516c;
+	bad[0].en = 0x80;		/* another enable bit */
+	bad[1].event = 0x2004;		/* the event outside the control byte */
+	bad[2].masked = 0;		/* masked by writing 0 */
+	bad[3].usid = 0xc;		/* no primary PMU at pmic@b's USID */
+	bad[4].parent = 254;		/* the interrupt on another controller */
+	bad[5].irq = 256;		/* not a peripheral interrupt */
+	bad[6].ctrl = 0x2001;		/* in pm-setting@2001 */
+	bad[6].event = 0x2001;
+	bad[7].alarm = 0x200c;		/* the compare value over the mask byte */
+	bad[8].offset[1] = 8;		/* another RTC offset than the tree's cell */
+	bad[9].alarm = 0xfffd;		/* beyond the SPMI registers */
+	bad[10].mask = U32_MAX;		/* no mask register */
+
+	for (i = 0; i < ARRAY_SIZE(bad); i++) {
+		struct gate_rtc r = {};
+		struct gate_adt adt;
+
+		gt_rtc_adt(test, &adt, &bad[i]);
+		KUNIT_ASSERT_EQ(test, gate_rtc_resolve(&r), 0);
+		KUNIT_EXPECT_EQ_MSG(test, gate_rtc_apply(&adt, &r), -EINVAL, "case %u", i);
+		KUNIT_EXPECT_NULL(test, r.cs);
+		gate_rtc_put(&r);
+		gt_rtc_untouched(test);
+	}
+}
+
+/* A device tree that is not as before the alarm is left alone. */
+static void __init gate_t6031_rtc_tree_refused(struct kunit *test)
+{
+	static const char *const why[] = { "wakeup-source", "#interrupt-cells", "rtc-alarm" };
+	struct gate_test *t = test->priv;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(why); i++) {
+		struct gate_rtc r = {};
+		struct device_node *np;
+
+		of_changeset_init(&t->cs);
+		if (i == 0) {
+			KUNIT_ASSERT_EQ(test, of_changeset_add_prop_bool(&t->cs, gt_node(test, GT_RTC_NODE),
+									 why[i]), 0);
+		} else if (i == 1) {
+			/* One cell, not the two the controller takes. */
+			KUNIT_ASSERT_EQ(test, of_changeset_add_prop_bool(&t->cs, gt_node(test, GT_RTC_SPMI),
+									 "interrupt-controller"), 0);
+			KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32(&t->cs, gt_node(test, GT_RTC_SPMI),
+									why[i], 1), 0);
+		} else {
+			np = of_changeset_create_node(&t->cs, gt_node(test, GT_RTC_LAYOUT),
+						      "rtc-alarm@2008");
+			KUNIT_ASSERT_NOT_NULL(test, np);
+			of_node_put(np);
+		}
+		KUNIT_ASSERT_EQ(test, of_changeset_apply(&t->cs), 0);
+		KUNIT_EXPECT_EQ_MSG(test, gate_rtc_resolve(&r), -EINVAL, "with %s", why[i]);
+		gate_rtc_put(&r);
+		KUNIT_EXPECT_EQ(test, of_changeset_revert(&t->cs), 0);
+		of_changeset_destroy(&t->cs);
+	}
+	of_changeset_init(&t->cs);
+	gt_rtc_untouched(test);
+}
+
+/* A controller described as an interrupt controller already keeps its own cells. */
+static void __init gate_t6031_rtc_controller_ready(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+	struct device_node *spmi = gt_node(test, GT_RTC_SPMI);
+	struct device_node *rtc = gt_node(test, GT_RTC_NODE);
+	phandle before = spmi->phandle;
+	struct of_phandle_args irq;
+	struct gate_rtc r = {};
+	struct gate_adt adt;
+
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_bool(&t->cs, spmi, "interrupt-controller"), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_u32(&t->cs, spmi, "#interrupt-cells", 2), 0);
+	KUNIT_ASSERT_EQ(test, of_changeset_apply(&t->cs), 0);
+	gt_rtc_adt(test, &adt, &gt_rtc_j516c);
+	KUNIT_ASSERT_EQ(test, gate_rtc_resolve(&r), 0);
+	KUNIT_EXPECT_TRUE(test, r.spmi_irqc);
+	KUNIT_ASSERT_EQ(test, gate_rtc_apply(&adt, &r), 0);
+	KUNIT_ASSERT_EQ(test, of_irq_parse_one(rtc, 0, &irq), 0);
+	KUNIT_EXPECT_PTR_EQ(test, irq.np, spmi);
+	of_node_put(irq.np);
+	gt_rtc_undo(test, &r, before);
+	gate_rtc_put(&r);
+}
+
+/* apple_t6031_rtc.alarm takes a boolean; anything else changes nothing. */
+static void __init gate_t6031_rtc_param(struct kunit *test)
+{
+	bool was = gate_t6031_rtc_alarm;
+
+	KUNIT_EXPECT_TRUE(test, was);
+	KUNIT_EXPECT_EQ(test, gate_setup_t6031_rtc_alarm("0"), 0);
+	KUNIT_EXPECT_FALSE(test, gate_t6031_rtc_alarm);
+	KUNIT_EXPECT_NE(test, gate_setup_t6031_rtc_alarm("maybe"), 0);
+	KUNIT_EXPECT_FALSE(test, gate_t6031_rtc_alarm);
+	KUNIT_EXPECT_NE(test, gate_setup_t6031_rtc_alarm(NULL), 0);
+	KUNIT_EXPECT_EQ(test, gate_setup_t6031_rtc_alarm("1"), 0);
+	KUNIT_EXPECT_TRUE(test, gate_t6031_rtc_alarm);
+	gate_t6031_rtc_alarm = was;
+}
+
+static struct kunit_case gate_t6031_rtc_cases[] __refdata = {
+	KUNIT_CASE(gate_t6031_rtc_param),
+	KUNIT_CASE(gate_t6031_rtc_described),
+	KUNIT_CASE(gate_t6031_rtc_adt_refused),
+	KUNIT_CASE(gate_t6031_rtc_tree_refused),
+	KUNIT_CASE(gate_t6031_rtc_controller_ready),
+	KUNIT_CASE(gate_t6031_rtc_described),
+	{}
+};
+
+static struct kunit_suite gate_t6031_rtc_suite __refdata = {
+	.name = "apple-display-gate-t6031-rtc",
+	.suite_init = gt_suite_init_rtc,
+	.init = gt_init_rtc,
+	.exit = gt_exit_rtc,
+	.test_cases = gate_t6031_rtc_cases,
+};
+
 /* T6030 first: the T6031 and T8122 trees describe a PMP, which it refuses. */
-kunit_test_init_section_suites(&gate_t6030_suite, &gate_t6031_suite, &gate_t8122_suite);
+kunit_test_init_section_suites(&gate_t6030_suite, &gate_t6031_suite, &gate_t8122_suite,
+			       &gate_t6031_rtc_suite);
