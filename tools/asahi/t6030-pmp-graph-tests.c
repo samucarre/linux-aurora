@@ -23,6 +23,8 @@ typedef uint8_t u8;
 #define PMP_REPORT_READY 1
 #define GFP_KERNEL 0
 #define GENPD_FLAG_ACTIVE_WAKEUP 1
+#define GENPD_FLAG_ALWAYS_ON 2
+#define GENPD_FLAG_IRQ_SAFE 4
 #define MAX_PHANDLE_ARGS 4
 #define EPROBE_DEFER 517
 #define SZ_4K 4096
@@ -126,7 +128,7 @@ struct apple_pmp_start {
 	struct apple_pmp_report *rep;
 	struct list_head list;
 	struct device_node *pmp;
-	u64 seed, ack, startup_ack, record_seed;
+	u64 seed, ack, startup_ack, record_seed, after;
 	const struct apple_pmp_start_ops *ops;
 	const struct apple_pmp_start_timing *timing;
 	struct work_struct work;
@@ -584,6 +586,20 @@ static const struct apple_pmp_start_ops apple_pmp_start_hw_ops = { hw_check,
 								   hw_bound };
 static const struct apple_pmp_start_timing apple_pmp_start_timing = { 2, 0, 2,
 								      2 };
+/*
+ * The T6031 entry whose request is set after the start (apple,request-after-
+ * start): no T6030 overlay entry has the property, so the probe never takes
+ * that path here. Unused with an older report source (--ref).
+ */
+static int __attribute__((unused))
+apple_pmp_report_entry_after_start(struct device *dev, struct apple_pmp_start *st,
+				   struct apple_pmp_report_entry *ent)
+{
+	(void)dev;
+	(void)st;
+	(void)ent;
+	abort();
+}
 #include "production.h"
 static const struct apple_pmp_report_offsets *
 of_device_get_match_data(struct device *d)
