@@ -4874,8 +4874,13 @@ static void dcp_release_after_sleep(struct apple_dcp *dcp)
  * displays off before sleep). A dark attached display sleeps with it:
  * suspend releases an HDMI link and keeps a Type-C tunnel, and resume finds
  * the display again as after DPMS off. Its firmware stays powered across
- * s2idle like the panel's (the gate holds its CPU domain at the active
- * floor), and the next attach reconnects through it.
+ * s2idle like the panel's, and the next attach reconnects through it:
+ * suspend puts the processor in the wakeup path, which keeps its power
+ * domains on where PMGR found them on at probe, as on T6030, whose boot
+ * loader hands them over on, and the T6031 display gate makes dispext0's
+ * always on, as they come up only after the PMP has acknowledged DISPEXT0.
+ * The active floor the gates give the CPU domain only stops automatic power
+ * gating; on its own it would not keep the firmware powered.
  *
  * A processor that failed (its start, or its session later) never refuses
  * sleep: it drives no display until reboot, attached or not, and its power
