@@ -2080,6 +2080,13 @@ static void __init gate_t8122_dcpext(bool panel)
  *    dispext0 not powered by Linux; the request is set once it is ready,
  *    and dispext0_sys, _cpu and _fe, and the DARTs, the mailbox and dcpext0
  *    in them, probe and power up only once the PMP has acknowledged it;
+ *  - keeps dispext0_sys, _cpu and _fe always on from then, through system
+ *    sleep too, as the panel's display domains stay on: dcpext0's firmware,
+ *    started when a display is first attached, is started only once per
+ *    boot. genpd keeps a domain on for a processor in the wakeup path (the
+ *    display driver puts dcpext0 there in suspend) only if PMGR found the
+ *    domain on when it probed it, as it finds the panel's, and nothing in
+ *    Linux has powered these up when they probe;
  *  - gives it a display subsystem of its own, bound by apple-drm-ext, so
  *    that the panel's DRM device neither waits for dcpext0 nor maps its
  *    framebuffers through dcpext0's display DART.
@@ -2754,6 +2761,12 @@ static int __init gate_t6031_ext_resolve(struct gate_t6031_ext *x, struct device
 	of_node_put(node);
 	if (!ok)
 		return gate_t6031_ext_refuse("dispext0_fe, _cpu and _sys do not nest as expected");
+	/* Always on from its probe (below), dispext0_sys needs its parent on then. */
+	node = gate_ps_parent(x->sys);
+	ok = of_property_read_bool(node, "apple,always-on");
+	of_node_put(node);
+	if (!ok)
+		return gate_t6031_ext_refuse("dispext0_sys's parent is not always on");
 	x->atc_common = gate_ps_unique("atc3_common");
 	x->atc_usb = gate_ps_unique("atc3_usb");
 	if (!x->atc_common || !x->atc_usb || !gate_ps_has_parent(x->atc_usb, x->atc_common))
@@ -3151,7 +3164,9 @@ static int __init gate_t6031_ext_build(struct gate_t6031_ext *x, struct device_n
 	 * power domain: genpd defers dispext0_sys, _cpu and _fe, and the DARTs,
 	 * the mailbox and dcpext0 in them, so nothing powers dispext0 up, and
 	 * fw_devlink (on by default) holds their probes, so PMGR writes
-	 * dispext0_cpu's floor, when that domain probes, only after it too.
+	 * dispext0_cpu's floor and turns the three domains on (always on, so
+	 * that system sleep keeps dcpext0's firmware powered), when each
+	 * probes, only after it too.
 	 */
 	cells[0] = ph_disp_dart;
 	cells[1] = 4;
@@ -3174,6 +3189,17 @@ static int __init gate_t6031_ext_build(struct gate_t6031_ext *x, struct device_n
 	      gate_x_cells(x, x->sys, "power-domains", &entry, 1, true) ?:
 	      /* The active floor the display driver checks before it runs dcpext0. */
 	      gate_set_u32(x->cs, x->cpu, "apple,min-state", PMGR_PS_ACTIVE) ?:
+	      /*
+	       * dcpext0's firmware runs from the first attach on and is never
+	       * started again: genpd must not power it off in system sleep.
+	       * The floor above only stops automatic power gating, and genpd
+	       * keeps a domain on for dcpext0 in the wakeup path only if PMGR
+	       * found it on at probe, as it finds the panel's: nothing in
+	       * Linux has powered these up by then.
+	       */
+	      gate_add_bool(x->cs, x->sys, "apple,always-on") ?:
+	      gate_add_bool(x->cs, x->cpu, "apple,always-on") ?:
+	      gate_add_bool(x->cs, x->fe, "apple,always-on") ?:
 	      /* As on T6030: no USB consumer holds ATC3 on across system sleep. */
 	      gate_add_bool(x->cs, x->atc_common, "apple,always-on");
 	if (ret)
@@ -3292,7 +3318,7 @@ static void __init gate_t6031_ext_run(bool panel, struct device_node **np)
 	gate_info("DCPEXT0: firmware %s preloaded; DATA %#llx and heap %#llx reserved, OS log %#llx; PMP request %pOF (bit %d) set once the PMP has started, the parent of %pOF\n",
 		  x->fw.uuid, x->fw.phys[GATE_SEG_DATA], x->fw.phys[GATE_SEG_HEAP],
 		  x->fw.phys[GATE_SEG_OSLOG], x->entry, GATE_T6031_DISPEXT0_REQ, x->sys);
-	gate_info("external displays enabled: dcpext0 for the HDMI port, %u nodes added, %u ATC3 common tunables, display clock %u Hz, DRM device %pOF; the PMP starts with the panel's requests alone, and dispext0 powers up once the PMP has acknowledged DISPEXT0\n",
+	gate_info("external displays enabled: dcpext0 for the HDMI port, %u nodes added, %u ATC3 common tunables, display clock %u Hz, DRM device %pOF; the PMP starts with the panel's requests alone, and dispext0 powers up once the PMP has acknowledged DISPEXT0 and stays on, through system sleep too\n",
 		  x->nr_new, x->nr_atc3_common, gate_t6031_ext_clock, subsys);
 out:
 	if (ret)
