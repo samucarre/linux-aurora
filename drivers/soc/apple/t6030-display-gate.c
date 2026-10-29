@@ -2013,6 +2013,13 @@ static void __init gate_t8122_dcpext(bool panel)
  *    display driver puts dcpext0 there in suspend) only if PMGR found the
  *    domain on when it probed it, as it finds the panel's, and nothing in
  *    Linux has powered these up when they probe;
+ *  - only with apple_t6031_display.ext_sleep_release=1, marks that request
+ *    apple,release-for-sleep, as gate_ext_apply() marks the T6030 ones: it
+ *    is then withdrawn in the noirq phase of system sleep, once dcpext0 has
+ *    suspended, and set again, once the PMP is ready and acknowledges it,
+ *    before dcpext0 resumes. dispext0 stays powered meanwhile, so the PMP
+ *    drops the request under a powered dispext0, which the boot order
+ *    above avoids; by default the request is kept through sleep;
  *  - gives it a display subsystem of its own, bound by apple-drm-ext, so
  *    that the panel's DRM device neither waits for dcpext0 nor maps its
  *    framebuffers through dcpext0's display DART.
@@ -2048,6 +2055,21 @@ static int __init gate_setup_t6031_ext_clock(char *arg)
 	return arg ? kstrtouint(arg, 0, &gate_t6031_ext_clock) : -EINVAL;
 }
 early_param("apple_t6031_display.ext_clock", gate_setup_t6031_ext_clock);
+
+/*
+ * apple_t6031_display.ext_sleep_release=1: withdraw DISPEXT0's PMP request
+ * in system sleep (apple,release-for-sleep), as the T6030 DISPEXT requests
+ * are. Off by default, until it is measured: dispext0 stays powered through
+ * sleep, so the request would be withdrawn under a powered dispext0, which
+ * the boot order avoids, and sleep is new on this board.
+ */
+static bool gate_t6031_ext_sleep_release __initdata;
+
+static int __init gate_setup_t6031_ext_sleep_release(char *arg)
+{
+	return arg ? kstrtobool(arg, &gate_t6031_ext_sleep_release) : -EINVAL;
+}
+early_param("apple_t6031_display.ext_sleep_release", gate_setup_t6031_ext_sleep_release);
 
 /* The outputs described: DCPEXT0's HDMI port. */
 #define GATE_T6031_EXT_OUTPUTS		BIT(0)
@@ -3111,6 +3133,15 @@ static int __init gate_t6031_ext_build(struct gate_t6031_ext *x, struct device_n
 	      of_changeset_add_prop_u32(x->cs, piodma, "apple,t6030-dispext-handoff", 1) ?:
 	      of_changeset_update_prop_string(x->cs, x->entry, "status", "okay") ?:
 	      gate_add_bool(x->cs, x->entry, "apple,request-after-start") ?:
+	      /*
+	       * On request only: as on T6030 no display is shown in system
+	       * sleep, so the PMP may drop the request then, but here it would
+	       * drop it under a powered dispext0 (always on, below). Its entry
+	       * withdraws it in the noirq phase, once dcpext0 has suspended, and
+	       * sets it again, waiting for the PMP, before dcpext0 resumes.
+	       */
+	      (gate_t6031_ext_sleep_release ?
+	       gate_add_bool(x->cs, x->entry, "apple,release-for-sleep") : 0) ?:
 	      gate_x_remove(x, x->entry, "power-domains") ?:
 	      gate_x_cells(x, x->sys, "power-domains", &entry, 1, true) ?:
 	      /* The active floor the display driver checks before it runs dcpext0. */
@@ -3241,9 +3272,12 @@ static void __init gate_t6031_ext_run(bool panel, struct device_node **np)
 	for (i = 0; i < x->nr_fix; i++)
 		x->fix[i]->phandle = x->fix_phandle[i];
 
-	gate_info("DCPEXT0: firmware %s preloaded; DATA %#llx and heap %#llx reserved, OS log %#llx; PMP request %pOF (bit %d) set once the PMP has started, the parent of %pOF\n",
+	gate_info("DCPEXT0: firmware %s preloaded; DATA %#llx and heap %#llx reserved, OS log %#llx; PMP request %pOF (bit %d) set once the PMP has started, the parent of %pOF, %s\n",
 		  x->fw.uuid, x->fw.phys[GATE_SEG_DATA], x->fw.phys[GATE_SEG_HEAP],
-		  x->fw.phys[GATE_SEG_OSLOG], x->entry, GATE_T6031_DISPEXT0_REQ, x->sys);
+		  x->fw.phys[GATE_SEG_OSLOG], x->entry, GATE_T6031_DISPEXT0_REQ, x->sys,
+		  gate_t6031_ext_sleep_release ?
+		  "withdrawn in system sleep (apple_t6031_display.ext_sleep_release=1)" :
+		  "kept through system sleep");
 	gate_info("external displays enabled: dcpext0 for the HDMI port, %u nodes added, %u ATC3 common tunables, display clock %u Hz, DRM device %pOF; the PMP starts with the panel's requests alone, and dispext0 powers up once the PMP has acknowledged DISPEXT0 and stays on, through system sleep too\n",
 		  x->nr_new, x->nr_atc3_common, gate_t6031_ext_clock, subsys);
 out:
