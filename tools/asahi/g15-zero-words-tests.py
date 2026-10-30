@@ -22,6 +22,9 @@ the whole hw.rs pin was refreshed with it. Both pins were refreshed again for
 the J516S cd05 FirmwareBuild row (one 18-line row with its comment; nothing
 else in the module changed). prepare_board() is pinned too;
 it was refreshed for the same Board change (its T6030 arm is unchanged).
+The hw.rs file pin was refreshed again for eight flights per VM (FLIGHTS
+and MAX_INFLIGHT in the sizes and tuning modules, with their comments);
+the T6030 module is unchanged.
 """
 
 import argparse
@@ -37,11 +40,11 @@ G15 = "drivers/gpu/drm/asahi/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "ef98b0a14892682d4ae0e2ca8699113e26c57f0e8ccb3f394345ab02eb1a8abe",
+    "hw.rs": "d8a44a097fd0dfaee5b8488b45bd80efd757dbf11d2bb00463bf64c7a3dbacf8",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {
-    ("hw.rs", "pub(crate) mod t6030 {"): "6c14108e82019301db96f07a679f523022ed67d6224d525d1541a4d7f62e2c88",
+    ("hw.rs", "pub(crate) mod t6030 {"): "2667963ad7a0957bacf8118965a500586637b622a99e49916f111fcd02670fcd",
     ("initdata.rs", "fn templates("): "c3115c9926d3d7d93317cb8510e93b04f30b0c256811d7137568e822dd93b8ee",
     ("initdata.rs", "pub(crate) fn prepare_board("): "ebef64ab87ef7b1f994eb7fa2a2424d05bc4fc9e88cbfbf18e51570bdfc4222d",
     ("board.rs", "pub(crate) fn from_adt("): "cecd0b28db5bd94d3b75c1bbb5f35204e8bf0699f74e5b3d08228c59025f6ac2",
