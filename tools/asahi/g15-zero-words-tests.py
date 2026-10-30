@@ -20,6 +20,9 @@ except for the J514S B0 FirmwareBuild row added to its firmware table: the
 module is the original pinned bytes (0079ae08) plus that one 15-line row, and
 the whole hw.rs pin was refreshed with it. prepare_board() is pinned too;
 it was refreshed for the same Board change (its T6030 arm is unchanged).
+The hw.rs file pin was refreshed again for eight flights per VM (FLIGHTS
+and MAX_INFLIGHT in the sizes and tuning modules, with their comments);
+the T6030 module is unchanged.
 """
 
 import argparse
@@ -35,7 +38,7 @@ G15 = "drivers/gpu/drm/asahi/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "e9b80be9b74b1521798e26b48962f34a61d6e3be3cf960792e54db95c6d54644",
+    "hw.rs": "a02df3d3c93a4711555e229b9c66e9fe8547339fd569164a42212b9b2ab5fc78",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {
