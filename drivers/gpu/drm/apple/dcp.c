@@ -191,6 +191,17 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
 
+/*
+ * Opt-in brightness ceiling of the internal mini-LED (XDR) panel, in nits,
+ * in place of the device tree's apple,max-brightness (500). These panels are
+ * rated for 1000 nits sustained full-screen, the most this accepts.
+ */
+#define DCP_XDR_SUSTAINED_NITS	1000U
+static unsigned int panel_nits_max;
+module_param(panel_nits_max, uint, 0444);
+MODULE_PARM_DESC(panel_nits_max,
+		 "Brightness ceiling of the internal mini-LED panel in nits, instead of apple,max-brightness (0 = device tree; at most 1000)");
+
 static bool dcpext_probe;
 module_param(dcpext_probe, bool, 0444);
 MODULE_PARM_DESC(dcpext_probe, "Opt into experimental T6030 external DCP probe (may hang)");
@@ -3807,8 +3818,16 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		if (of_device_is_available(panel_np)) {
 			ret = of_property_read_u32(panel_np, "apple,max-brightness",
 						   &dcp->brightness.maximum);
-			if (ret)
+			if (ret) {
 				dev_err(dev, "Missing property 'apple,max-brightness'\n");
+			} else if (panel_nits_max && dcp->panel.has_mini_led) {
+				u32 nits = min(panel_nits_max, DCP_XDR_SUSTAINED_NITS);
+
+				dev_info(dev, "panel brightness ceiling %u nits (appledrm.panel_nits_max; device tree %u)\n",
+					 nits, dcp->brightness.maximum);
+				dcp->brightness.maximum = nits;
+				dcp->brightness.nits_override = true;
+			}
 		}
 
 		of_property_read_u32(panel_np, "width-mm", &dcp->panel.width_mm);

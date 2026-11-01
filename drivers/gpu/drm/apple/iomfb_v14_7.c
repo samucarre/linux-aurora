@@ -425,7 +425,8 @@ static void dcp_v14_backlight_kick(struct apple_dcp *dcp)
 
 /*
  * The panel's level policy, set up once the panel runs: at most 500 nits
- * (less if the panel's DT record says so), and no fades. No boot loader
+ * (less if the panel's DT record says so; up to DCP_V14_NITS_WIRE_MAX with
+ * appledrm.panel_nits_max), and no fades. No boot loader
  * level is known, so none is presented until userspace sets one; until
  * then the backlight reports DCP_V14_NITS_DEFAULT as its requested level
  * and no actual level (dcp_backlight.c). dcp_backlight_configure()
@@ -441,8 +442,14 @@ static void dcp_v14_configure_backlight(struct apple_dcp *dcp)
 	    !v14->started || dcp_backlight_active(dcp) ||
 	    !dcp_has_panel(dcp) || !dcp->crtc)
 		return;
-	/* A described panel maximum may only lower the wire bound. */
-	if (dcp->brightness.maximum)
+	/*
+	 * A described panel maximum may only lower the default bound; the
+	 * opt-in ceiling (appledrm.panel_nits_max) replaces it, up to the
+	 * wire bound.
+	 */
+	if (dcp->brightness.nits_override)
+		maximum = min_t(u32, dcp->brightness.maximum, DCP_V14_NITS_WIRE_MAX);
+	else if (dcp->brightness.maximum)
 		maximum = min(maximum, dcp->brightness.maximum);
 	ret = dcp_backlight_configure(dcp, maximum, false, 0, true,
 				      min_t(u32, maximum, DCP_V14_NITS_DEFAULT),

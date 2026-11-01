@@ -163,6 +163,8 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
+	/* maximum comes from appledrm.panel_nits_max, not the device tree */
+	bool nits_override;
 };
 
 struct audiosrv_data;
