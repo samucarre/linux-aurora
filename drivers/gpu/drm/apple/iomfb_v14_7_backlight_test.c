@@ -41,7 +41,7 @@ static void v14_bl_binary64(struct kunit *test)
 		KUNIT_EXPECT_EQ_MSG(test, dcp_v14_nits_binary64(known[i].nits), known[i].bits,
 				    "%u nits", known[i].nits);
 	/* Every level up to the bound is an exact integral binary64. */
-	for (nits = 1; nits <= DCP_V14_NITS_MAX; nits++) {
+	for (nits = 1; nits <= DCP_V14_NITS_WIRE_MAX; nits++) {
 		u64 bits = dcp_v14_nits_binary64(nits);
 		unsigned int e = (bits >> 52) - 1023;
 		u64 mantissa = bits & GENMASK_ULL(51, 0);
@@ -65,7 +65,7 @@ static void v14_bl_level_block(struct kunit *test)
 	memcpy(before, swap, DCP_V14_SWAP_SIZE);
 
 	/* Above the wire bound: refused, the record untouched. */
-	KUNIT_EXPECT_EQ(test, dcp_v14_encode_nits(swap, true, DCP_V14_NITS_MAX + 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dcp_v14_encode_nits(swap, true, DCP_V14_NITS_WIRE_MAX + 1), -EINVAL);
 	KUNIT_EXPECT_EQ(test, memcmp(swap, before, DCP_V14_SWAP_SIZE), 0);
 
 	/* A level touches only the present byte and the binary64. */

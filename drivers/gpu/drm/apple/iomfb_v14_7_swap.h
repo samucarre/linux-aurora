@@ -40,8 +40,14 @@
  */
 #define DCP_V14_SWAP_NITS_PRESENT	0x354
 #define DCP_V14_SWAP_NITS		0x35c
-/* The nits field takes integral levels up to the panel maximum. */
+/*
+ * The nits field takes integral levels up to DCP_V14_NITS_WIRE_MAX, the XDR
+ * panels' sustained full-screen rating. The backlight's ceiling stays
+ * DCP_V14_NITS_MAX (or the panel's DT record, if lower) unless
+ * appledrm.panel_nits_max raises it.
+ */
 #define DCP_V14_NITS_MAX		500
+#define DCP_V14_NITS_WIRE_MAX		1000
 /*
  * The level userspace is shown before Linux has set one. It is never
  * presented on its own: until a level is requested the panel keeps the boot
@@ -71,7 +77,7 @@ static inline u64 dcp_v14_nits_binary64(u32 nits)
  */
 static inline int dcp_v14_encode_nits(u8 *swap, bool change, u32 nits)
 {
-	if (change && nits > DCP_V14_NITS_MAX)
+	if (change && nits > DCP_V14_NITS_WIRE_MAX)
 		return -EINVAL;
 	swap[DCP_V14_SWAP_NITS_PRESENT] = change;
 	put_unaligned_le64(change ? dcp_v14_nits_binary64(nits) : 0,
