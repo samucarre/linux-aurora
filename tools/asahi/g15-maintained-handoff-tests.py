@@ -159,7 +159,7 @@ fn main() {
     )), 0);
     assert!(matches!(identify(&measured, b"apple,j514s"), Verdict::Pinned(_)),
             "J514S cd05 firmware must pin without a prefix override");
-    assert_eq!(identify(&measured, b"apple,j516s"), Verdict::Refused);
+    assert!(matches!(identify(&measured, b"apple,j516s"), Verdict::Pinned(_)));
     let mut changed = measured;
     changed.sha256[31] ^= 1;
     assert_eq!(identify(&changed, b"apple,j514s"), Verdict::Refused);
@@ -169,6 +169,9 @@ fn main() {
     assert_eq!(identify(&changed, b"apple,j514s"), Verdict::Refused);
     changed = measured; changed.marker += 8;
     assert_eq!(identify(&changed, b"apple,j514s"), Verdict::Refused);
+    assert_eq!(BUILDS[4].machine.unwrap().to_bytes(), b"apple,j516s");
+    assert_eq!((BUILDS[4].text_size, BUILDS[4].data_size, BUILDS[4].marker), (0x5c000, 0x114000, 0x58e88));
+    assert_eq!(BUILDS[4].text_sha256, [0xcd,0x05,0xaf,0x6a,0x82,0x8b,0x52,0xe4,0xc2,0xfe,0xd2,0x00,0x86,0xd3,0xd1,0x8a,0x7d,0xb4,0x2e,0x03,0xa8,0xfd,0x6f,0x83,0x54,0xf9,0xf0,0x6e,0x0a,0x61,0x36,0x3e]);
     for error in [0, -517, -12] {
         INIT_ERROR.set(error); let shared = Arc::new(Shared); let result = Rtkit::new(&dev, &shared);
         assert_eq!(result.is_ok(), error == 0);
