@@ -16,6 +16,15 @@
 //! first render prefix after boot, an exclusive one-render prefix rebuilds the render
 //! allocators and blocks publication behind it until it retires.
 //!
+//! Compute share budget: a job of another VM held behind published flights marks the engine
+//! *contended* for `g15_share_window_ms` (500). While contended, one prefix is in flight rather
+//! than [`super::hw::tuning::MAX_INFLIGHT`], and the computes of a prefix, horizon included, are
+//! bounded by `g15_share_budget_us` (4000) over the queue's mean compute command time (an EWMA of
+//! the CDM stage times read at retirement), never below one; so the waiting VM waits for one
+//! budgeted prefix and the drain rather than every published horizon. Uncontended, or with a
+//! budget of 0, publication is as without it. It is policy only: the encoding, barriers, stamps,
+//! slots, the one-VM rule and recovery are the same either way.
+//!
 //! Barrier types per edge (type 0 = firmware stamp only, 1 = also the predecessor job hold):
 //! FS -> own TA 0; TA -> previous FS 0 only inside a prefix after a render with no
 //! InitBM/resync, else 1; compute -> TA 1 on class 2; FS -> compute 1 (`CROSS_ENGINE_HOLD`
@@ -259,15 +268,19 @@ pub(crate) struct Stats {
     /// Jobs published behind another in a compute horizon.
     pub(crate) grouped: u64,
     /// Compute-only prefixes by jobs; why grouping stopped (no further ready job, the cap,
-    /// compute slots, a job of the queue that does not qualify); behind a running prefix; of
-    /// those behind its unconsumed record.
+    /// compute slots, a job of the queue that does not qualify, the share budget); behind a
+    /// running prefix; of those behind its unconsumed record.
     pub(crate) hz: [u64; sizes::HORIZON_JOBS as usize],
-    pub(crate) hz_stop: [u64; 4],
+    pub(crate) hz_stop: [u64; 5],
     pub(crate) hz_behind: u64,
     pub(crate) hz_ahead: u64,
     /// Why ready jobs stayed unpublished: both flights published, a channel record unconsumed,
-    /// no free slot.
-    pub(crate) hold: [u64; 3],
+    /// no free slot, a job of another VM behind published flights (also counted with the first
+    /// when both hold).
+    pub(crate) hold: [u64; 4],
+    /// Prefixes published under the compute share budget; of those, prefixes it cut short.
+    pub(crate) share_flights: u64,
+    pub(crate) share_capped: u64,
 }
 
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
@@ -358,6 +371,11 @@ pub(crate) struct Engine {
     pub(crate) frozen: bool,
     /// Service turn counter for the least-recently-served pick.
     pub(crate) turn: u64,
+    /// When a job of another VM was last held behind published flights, ns (0: never): the
+    /// compute share budget's contention signal.
+    pub(crate) contended_ns: u64,
+    /// The compute share budget of the current publication pass, ns (0: not contended, or off).
+    pub(crate) share_ns: u64,
     /// The device's shared state, for the transport-error latch; set by the first poll or
     /// submission.
     pub(crate) shared: Option<Arc<Shared>>,
@@ -414,6 +432,8 @@ impl Engine {
             retained: KVec::new(),
             frozen: false,
             turn: 0,
+            contended_ns: 0,
+            share_ns: 0,
             shared: None,
             ordinal: 0,
             draw: 0,
@@ -457,6 +477,17 @@ impl Engine {
             .filter(|f| Arc::ptr_eq(&f.job.queue, &job.queue))
             .map(|f| 1 + f.group.len() as u32)
             .sum()
+    }
+
+    /// The compute share budget at `now`, ns: `g15_share_budget_us` while a job of another VM
+    /// was held within `g15_share_window_ms`, else 0.
+    fn share_budget(&self, now: u64) -> u64 {
+        let budget = params::share_budget_ns();
+        if budget != 0 && is_contended(now, self.contended_ns, params::share_window_ns()) {
+            budget
+        } else {
+            0
+        }
     }
 
     /// Index in `pending` of the next ready job: highest queue priority, then the queue served
@@ -503,6 +534,54 @@ fn is_render(job: &Job, k: u32) -> bool {
 /// Whole compute-only job.
 fn compute_only(job: &Job) -> bool {
     (0..job.progress.count()).all(|k| !is_render(job, k))
+}
+
+/// Contended at `now`: a job of another VM was held behind published flights at `since` (0:
+/// never), less than `window_ns` before.
+pub(crate) fn is_contended(now: u64, since: u64, window_ns: u64) -> bool {
+    since != 0 && now.saturating_sub(since) < window_ns
+}
+
+/// The prefixes that may be in flight: one while contended, so that a job of another VM waits
+/// for one budgeted prefix rather than `max`.
+pub(crate) fn share_inflight(contended: bool, max: usize) -> usize {
+    if contended {
+        max.min(1)
+    } else {
+        max
+    }
+}
+
+/// The computes a prefix, horizon included, may take of `free` free compute slots under a share
+/// budget of `budget_ns` (0: none, all of them), with `avg_ns` the queue's mean compute command
+/// time: as many as fit the budget, never fewer than one while a slot is free, so a prefix that
+/// fits today still fits (no new E2BIG). Without an estimate yet (`avg_ns` 0) one: another VM
+/// waits, one command bounds its wait until the first retirement measures the queue, and a full
+/// prefix is the unbounded wait the budget is there to prevent.
+pub(crate) fn share_cap(free: u32, budget_ns: u64, avg_ns: u64) -> u32 {
+    if budget_ns == 0 {
+        return free;
+    }
+    let fit = if avg_ns == 0 { 1 } else { budget_ns / avg_ns };
+    fit.max(1).min(free as u64) as u32
+}
+
+/// The next mean compute command time, ns, from `prev` (0: none yet) and the mean `sample` of a
+/// retired prefix: an EWMA of weight 1/8 (about a token of llama.cpp submissions), seeded by the
+/// first sample. A zero sample (no valid stage interval) leaves it as it is.
+pub(crate) fn ewma_update(prev: u64, sample: u64) -> u64 {
+    if sample == 0 {
+        return prev;
+    }
+    if prev == 0 {
+        return sample;
+    }
+    (prev - prev / 8).saturating_add(sample / 8)
+}
+
+/// Internal stage timestamp ticks (24 MHz) in ns: 1000 / 24 = 125 / 3 ns each.
+pub(crate) fn ticks_ns(ticks: u64) -> u64 {
+    ticks.saturating_mul(125) / 3
 }
 
 /// Pushes a job's completion; [`Job::complete`] only acts the first time.
@@ -553,7 +632,12 @@ impl Firmware {
     /// Returns Err only when this call latched the engine failed (a publication error after a
     /// queue WRITE advanced, or a partly sent job): the caller latches the fail-stop.
     pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
-        let max_inflight = tuning::MAX_INFLIGHT.clamp(1, sizes::FLIGHTS as u32) as usize;
+        // The compute share budget holds for the whole pass: a hold below ends it.
+        self.engine.share_ns = self.engine.share_budget(now_ns());
+        let max_inflight = share_inflight(
+            self.engine.share_ns != 0,
+            tuning::MAX_INFLIGHT.clamp(1, sizes::FLIGHTS as u32) as usize,
+        );
         let mut result = Ok(());
 
         self.engine.chan_wait = false;
@@ -573,14 +657,20 @@ impl Firmware {
             // renders or ~4.0M computes with margins of 100000).
             let renumber_due = self.renumber_due();
             if let Some(tail) = self.engine.flights.last() {
+                let other_vm = !Arc::ptr_eq(&job.vm, &tail.job.vm);
                 if self.engine.flights.len() >= max_inflight
-                    || !Arc::ptr_eq(&job.vm, &tail.job.vm)
+                    || other_vm
                     || self.recovery.reinit
                     || self.recovery.fs_resync
                     || self.engine.rebuild_live
                     || renumber_due
                 {
                     self.engine.stats.hold[0] += (self.engine.flights.len() >= max_inflight) as u64;
+                    if other_vm {
+                        // It waits for every published flight: the share budget's signal.
+                        self.engine.contended_ns = now_ns();
+                        self.engine.stats.hold[3] += 1;
+                    }
                     break;
                 }
                 if !Arc::ptr_eq(&tail.job, &job) && tail.job.progress.is_pending() {
@@ -635,7 +725,8 @@ impl Firmware {
     }
 
     /// Ready jobs the compute horizon of `job` could take now, besides `job` itself: the
-    /// grouping rules of [`Self::publish_prefix`], at most `max - 1`.
+    /// grouping rules of [`Self::publish_prefix`], at most `max - 1`, within `free_c` computes
+    /// (the free compute slots, or the share budget's cap of them).
     fn horizon_ready(&self, job: &Arc<Job>, mut computes: u32, free_c: u32, max: u32) -> u32 {
         let mut n = 0;
         for j2 in self.engine.pending.iter() {
@@ -838,6 +929,14 @@ impl Firmware {
         self.engine.stats.prep_from_ns = now_ns();
         let mut lap = Lap::start();
         let free_c = self.slots.free_compute();
+        // While another VM waits (`publish`), the share budget bounds the computes of the
+        // prefix, horizon included, to at least one of the free slots (all of them without).
+        let cap_c = share_cap(
+            free_c,
+            self.engine.share_ns,
+            job.queue.avg_compute_ns.load(Ordering::Relaxed),
+        );
+        let mut capped = false;
         // After an abort the prefix that rebuilds the render allocators holds renders only (see
         // `publish`): a compute published with it, or behind it before it retired, crashed the
         // 2419 firmware in its progress path (F+0x35568, FAR 0x58) after a recovered hang whose
@@ -853,7 +952,8 @@ impl Firmware {
             }
             match cmd {
                 Command::Compute(_) => {
-                    if computes == free_c {
+                    if computes == cap_c {
+                        capped = cap_c < free_c;
                         break;
                     }
                     computes += 1;
@@ -899,7 +999,7 @@ impl Firmware {
         let mut ahead = overlap && renders != 0 && tuning::SUBMIT_AHEAD;
         if overlap && renders == 0 && end == count && tuning::SUBMIT_AHEAD {
             let max = tuning::COMPUTE_HORIZON.clamp(1, sizes::HORIZON_JOBS);
-            let ready = 1 + self.horizon_ready(job, computes, free_c, max);
+            let ready = 1 + self.horizon_ready(job, computes, cap_c, max);
             let depth = job
                 .queue
                 .owned
@@ -1013,6 +1113,11 @@ impl Firmware {
                     hz_stop = Some(2);
                     break;
                 }
+                if computes + n2 > cap_c {
+                    hz_stop = Some(4);
+                    capped = true;
+                    break;
+                }
                 // Without room for another group entry the horizon ends here: the base job
                 // is published already, and nothing of `j2` has been touched or sent, so a
                 // transient allocation failure must not fail the prefix (which, after a queue
@@ -1115,6 +1220,11 @@ impl Firmware {
             self.renew_deadlines();
         }
         job.progress.set_sent(end);
+        if self.engine.share_ns != 0 {
+            let s = &mut self.engine.stats;
+            s.share_flights += 1;
+            s.share_capped += capped as u64;
+        }
         if let Some(stop) = hz_stop {
             let s = &mut self.engine.stats;
             s.hz[f.group.len()] += 1;
