@@ -634,7 +634,7 @@ impl Firmware {
     pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
         // The compute share budget holds for the whole pass: a hold below ends it.
         self.engine.share_ns = self.engine.share_budget(now_ns());
-        let max_inflight = share_inflight(self.engine.share_ns != 0, params::max_inflight() as usize);
+        let max_inflight = params::max_inflight() as usize;
         let mut result = Ok(());
 
         self.engine.chan_wait = false;
@@ -653,16 +653,20 @@ impl Firmware {
             // drain and the next publication renumbers the stamps while idle (once every ~8.7M
             // renders or ~4.0M computes with margins of 100000).
             let renumber_due = self.renumber_due();
+            // While contended only a compute-only job is held to one prefix in flight: the budget
+            // bounds a compute client, and render jobs keep `g15_max_inflight` flights, so that a
+            // desktop of several GL clients (always contended) does not fall to one flight.
+            let cap = share_inflight(self.engine.share_ns != 0 && compute_only(&job), max_inflight);
             if let Some(tail) = self.engine.flights.last() {
                 let other_vm = !Arc::ptr_eq(&job.vm, &tail.job.vm);
-                if self.engine.flights.len() >= max_inflight
+                if self.engine.flights.len() >= cap
                     || other_vm
                     || self.recovery.reinit
                     || self.recovery.fs_resync
                     || self.engine.rebuild_live
                     || renumber_due
                 {
-                    self.engine.stats.hold[0] += (self.engine.flights.len() >= max_inflight) as u64;
+                    self.engine.stats.hold[0] += (self.engine.flights.len() >= cap) as u64;
                     if other_vm {
                         // It waits for every published flight: the share budget's signal.
                         self.engine.contended_ns = now_ns();
